@@ -180,7 +180,7 @@ DEFAULT_PRESETS = {
         "fade_out": True,
         "combo_style": "Dezent & Sanft (Nur weiche Uebergaenge)",
         "fx_intensity": 70,
-        "fx_shake": false,
+        "fx_shake": False,
         "fx_bloom_flash": True,
         "fx_punch_zoom": False,
         "fx_slow_push": True,

@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+env/
+ENV/
+.env
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# MoviePy / Librosa / temporary files
+*.tmp
+temp/
+output/
+output*.mp4
+*.mp4
+*.mp3
+*.wav
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

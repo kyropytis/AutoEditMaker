@@ -1,0 +1,5 @@
+customtkinter
+moviepy==1.0.3
+librosa
+numpy
+pygame

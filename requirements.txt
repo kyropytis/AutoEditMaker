@@ -1,5 +1,9 @@
 customtkinter
 moviepy==1.0.3
+imageio-ffmpeg
 librosa
 numpy
 pygame
+Pillow
+opencv-python
+scipy

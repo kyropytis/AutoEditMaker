@@ -16,6 +16,7 @@ import pygame
 import imageio_ffmpeg
 import PIL.Image
 import PIL.ImageDraw
+import json
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -100,6 +101,131 @@ _y_lut = 1.0 / (1.0 + np.exp(-9.0 * (_x_lut - 0.5)))
 _y_lut = (_y_lut - _y_lut.min()) / (_y_lut.max() - _y_lut.min())
 CINEMATIC_LUT = np.clip(_y_lut * 255.0, 0, 255).astype(np.uint8)
 
+def _build_vignette_mask(w, h):
+    X = cv2.getGaussianKernel(w, w * 0.48)
+    Y = cv2.getGaussianKernel(h, h * 0.48)
+    kernel = Y * X.T
+    kernel = kernel / kernel.max()
+    vig = np.clip(0.68 + 0.32 * kernel, 0, 1)
+    vig_u8 = np.clip(vig * 255.0, 0, 255).astype(np.uint8)
+    return cv2.merge([vig_u8, vig_u8, vig_u8])
+
+# Default Presets
+DEFAULT_PRESETS = {
+    "TikTok Montage / Beat Drop": {
+        "mode": "auto",
+        "pace": "1x (Jeder Takt)",
+        "orientation": "portrait",
+        "scale_mode": "fill",
+        "fps": 60,
+        "quality": "High Quality (CRF 16 Studio)",
+        "resolution": "1080p (Full HD)",
+        "clip_audio": "Stumm (100% Musik)",
+        "fade_out": True,
+        "combo_style": "Impact-Combo (Gleichzeitig auf Beat-Hits gestapelt)",
+        "fx_intensity": 130,
+        "fx_shake": True,
+        "fx_bloom_flash": True,
+        "fx_punch_zoom": True,
+        "fx_slow_push": True,
+        "fx_rgb_shock": True,
+        "fx_vignette": True,
+        "fx_speedramp": True,
+        "fx_cinematic_lut": True,
+        "enable_overlay": False,
+        "overlay_corner": "In der Mitte (Zentriert)",
+        "overlay_size": "Gross (45% Bildhoehe)",
+        "overlay_speed": 1.8,
+        "overlay_opacity": 100,
+        "overlay_start_mode": "drop",
+        "overlay_circle": True
+    },
+    "Velocity / Action Edit": {
+        "mode": "onsets",
+        "pace": "2x Schnell (Halber Takt)",
+        "orientation": "portrait",
+        "scale_mode": "fill",
+        "fps": 60,
+        "quality": "High Quality (CRF 16 Studio)",
+        "resolution": "1080p (Full HD)",
+        "clip_audio": "Dezent 15% (Killsounds/SFX)",
+        "fade_out": True,
+        "combo_style": "Impact-Combo (Gleichzeitig auf Beat-Hits gestapelt)",
+        "fx_intensity": 100,
+        "fx_shake": True,
+        "fx_bloom_flash": True,
+        "fx_punch_zoom": True,
+        "fx_slow_push": False,
+        "fx_rgb_shock": True,
+        "fx_vignette": True,
+        "fx_speedramp": True,
+        "fx_cinematic_lut": True,
+        "enable_overlay": False,
+        "overlay_corner": "Wechselt zum Takt (Animiert)",
+        "overlay_size": "Mittel (30% Bildhoehe)",
+        "overlay_speed": 1.2,
+        "overlay_opacity": 100,
+        "overlay_start_mode": "drop",
+        "overlay_circle": True
+    },
+    "Cinematic Flow & Aesthetic": {
+        "mode": "auto",
+        "pace": "1x (Jeder Takt)",
+        "orientation": "landscape",
+        "scale_mode": "fill",
+        "fps": 60,
+        "quality": "Maximal (CRF 14 Glasklar)",
+        "resolution": "1440p (2K Ultra Sharp)",
+        "clip_audio": "Stumm (100% Musik)",
+        "fade_out": True,
+        "combo_style": "Dezent & Sanft (Nur weiche Uebergaenge)",
+        "fx_intensity": 70,
+        "fx_shake": false,
+        "fx_bloom_flash": True,
+        "fx_punch_zoom": False,
+        "fx_slow_push": True,
+        "fx_rgb_shock": False,
+        "fx_vignette": True,
+        "fx_speedramp": False,
+        "fx_cinematic_lut": True,
+        "enable_overlay": False,
+        "overlay_corner": "Oben Rechts",
+        "overlay_size": "Kompakt (20% Bildhoehe)",
+        "overlay_speed": 1.0,
+        "overlay_opacity": 85,
+        "overlay_start_mode": "start",
+        "overlay_circle": True
+    },
+    "Clean & Minimal (Pure Cuts)": {
+        "mode": "auto",
+        "pace": "1x (Jeder Takt)",
+        "orientation": "portrait",
+        "scale_mode": "fill",
+        "fps": 60,
+        "quality": "High Quality (CRF 16 Studio)",
+        "resolution": "1080p (Full HD)",
+        "clip_audio": "Stumm (100% Musik)",
+        "fade_out": True,
+        "combo_style": "Dezent & Sanft (Nur weiche Uebergaenge)",
+        "fx_intensity": 40,
+        "fx_shake": False,
+        "fx_bloom_flash": False,
+        "fx_punch_zoom": False,
+        "fx_slow_push": False,
+        "fx_rgb_shock": False,
+        "fx_vignette": False,
+        "fx_speedramp": False,
+        "fx_cinematic_lut": False,
+        "enable_overlay": False,
+        "overlay_corner": "In der Mitte (Zentriert)",
+        "overlay_size": "Mittel (30% Bildhoehe)",
+        "overlay_speed": 1.0,
+        "overlay_opacity": 100,
+        "overlay_start_mode": "start",
+        "overlay_circle": True
+    }
+}
+
 # =====================================================================
 # Theme & Configuration
 # =====================================================================
@@ -126,9 +252,37 @@ class EditMakerApp(ctk.CTk):
         self.source_image_cache = {}
         self.ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
+        self.presets_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
+        self.all_presets = self._load_presets_from_disk()
+
         pygame.mixer.init()
 
         self._build_ui()
+
+    def _load_presets_from_disk(self):
+        presets = dict(DEFAULT_PRESETS)
+        if os.path.exists(self.presets_file):
+            try:
+                with open(self.presets_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        presets.update(data)
+            except Exception as e:
+                print(f"Fehler beim Laden von presets.json: {e}")
+        else:
+            try:
+                with open(self.presets_file, "w", encoding="utf-8") as f:
+                    json.dump(presets, f, indent=4, ensure_ascii=False)
+            except Exception:
+                pass
+        return presets
+
+    def _save_presets_to_disk(self):
+        try:
+            with open(self.presets_file, "w", encoding="utf-8") as f:
+                json.dump(self.all_presets, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Fehler beim Speichern von presets.json: {e}")
 
     # =====================================================================
     # UI Building
@@ -140,18 +294,81 @@ class EditMakerApp(ctk.CTk):
         # 1. Header
         lbl_title = ctk.CTkLabel(
             self.main_container,
-            text="🎬 Auto Beat-Sync Edit Maker",
+            text="Auto Beat-Sync Edit Maker",
             font=("Arial", 26, "bold")
         )
         lbl_title.pack(pady=(4, 2))
         
         lbl_sub = ctk.CTkLabel(
             self.main_container,
-            text="Pro Studio Engine • Multi-Band Transient Sync • 60 FPS • OpenCV Hardware-Beschleunigung",
+            text="Pro Studio Engine | Multi-Band Transient Sync | 60 FPS | OpenCV Hardware-Beschleunigung",
             text_color="#38bdf8",
             font=("Arial", 12)
         )
-        lbl_sub.pack(pady=(0, 12))
+        lbl_sub.pack(pady=(0, 10))
+
+        # Profile & Preset Management Frame
+        profile_frame = ctk.CTkFrame(self.main_container)
+        profile_frame.pack(fill="x", pady=5)
+
+        header_prof = ctk.CTkFrame(profile_frame, fg_color="transparent")
+        header_prof.pack(fill="x", padx=12, pady=(8, 2))
+        ctk.CTkLabel(header_prof, text="Profile & Presets (Speichern & Laden)", font=("Arial", 14, "bold")).pack(side="left")
+
+        row_prof = ctk.CTkFrame(profile_frame, fg_color="transparent")
+        row_prof.pack(fill="x", padx=12, pady=(3, 8))
+
+        ctk.CTkLabel(row_prof, text="Profil:").pack(side="left", padx=(0, 6))
+        self.preset_names = list(self.all_presets.keys())
+        self.profile_var = ctk.StringVar(value=self.preset_names[0] if self.preset_names else "Standard")
+        self.combo_profile = ctk.CTkComboBox(
+            row_prof,
+            values=self.preset_names,
+            variable=self.profile_var,
+            command=self.on_profile_selected,
+            width=230
+        )
+        self.combo_profile.pack(side="left", padx=4)
+
+        self.btn_save_profile = ctk.CTkButton(
+            row_prof,
+            text="Profil speichern",
+            command=self.save_current_as_profile,
+            fg_color="#1f8a4c",
+            hover_color="#176b3b",
+            width=120
+        )
+        self.btn_save_profile.pack(side="left", padx=4)
+
+        self.btn_load_json = ctk.CTkButton(
+            row_prof,
+            text="JSON laden",
+            command=self.import_profile_json,
+            fg_color="#2b719e",
+            hover_color="#1f5375",
+            width=90
+        )
+        self.btn_load_json.pack(side="left", padx=4)
+
+        self.btn_export_json = ctk.CTkButton(
+            row_prof,
+            text="Export",
+            command=self.export_profile_json,
+            fg_color="#444444",
+            hover_color="#555555",
+            width=75
+        )
+        self.btn_export_json.pack(side="left", padx=4)
+
+        self.btn_delete_prof = ctk.CTkButton(
+            row_prof,
+            text="Loeschen",
+            command=self.delete_current_profile,
+            fg_color="#8b1e1e",
+            hover_color="#631414",
+            width=75
+        )
+        self.btn_delete_prof.pack(side="left", padx=4)
 
         # 2. Media Selection Frame
         media_frame = ctk.CTkFrame(self.main_container)
@@ -169,7 +386,7 @@ class EditMakerApp(ctk.CTk):
 
         self.btn_select_videos = ctk.CTkButton(
             btn_row_media,
-            text="📁 Clips / Bilder wählen",
+            text="Clips / Bilder wählen",
             command=self.select_videos,
             width=180
         )
@@ -214,7 +431,7 @@ class EditMakerApp(ctk.CTk):
 
         self.btn_select_audio = ctk.CTkButton(
             btn_row_audio,
-            text="🎵 Song auswählen",
+            text="Song auswählen",
             command=self.select_audio,
             width=180
         )
@@ -222,7 +439,7 @@ class EditMakerApp(ctk.CTk):
 
         self.btn_audio_preview = ctk.CTkButton(
             btn_row_audio,
-            text="▶ Vorhören",
+            text="Vorhören",
             command=self.toggle_audio_preview,
             fg_color="#2b719e",
             hover_color="#1f5375",
@@ -250,7 +467,7 @@ class EditMakerApp(ctk.CTk):
         self.slider_end.set(0)
         self.slider_end.pack(side="right", fill="x", expand=True, padx=5)
 
-        # 4. Beat Detection & Pacing Frame (Upgraded Multi-Band Engine)
+        # 4. Beat Detection & Pacing Frame (Multi-Band Engine)
         sync_frame = ctk.CTkFrame(self.main_container)
         sync_frame.pack(fill="x", pady=5)
 
@@ -289,8 +506,8 @@ class EditMakerApp(ctk.CTk):
         ctk.CTkLabel(row_fmt, text="Format:").pack(side="left", padx=(0, 8))
         self.orient_var = ctk.StringVar(value="original")
         ctk.CTkRadioButton(row_fmt, text="Originalformat (Kein Zoom)", variable=self.orient_var, value="original").pack(side="left", padx=6)
-        ctk.CTkRadioButton(row_fmt, text="📱 Hochkant (9:16)", variable=self.orient_var, value="portrait").pack(side="left", padx=6)
-        ctk.CTkRadioButton(row_fmt, text="🖥 Quer (16:9)", variable=self.orient_var, value="landscape").pack(side="left", padx=6)
+        ctk.CTkRadioButton(row_fmt, text="Hochkant (9:16)", variable=self.orient_var, value="portrait").pack(side="left", padx=6)
+        ctk.CTkRadioButton(row_fmt, text="Quer (16:9)", variable=self.orient_var, value="landscape").pack(side="left", padx=6)
 
         row_scale_fps = ctk.CTkFrame(format_frame, fg_color="transparent")
         row_scale_fps.pack(fill="x", padx=12, pady=3)
@@ -309,13 +526,13 @@ class EditMakerApp(ctk.CTk):
         row_quality.pack(fill="x", padx=12, pady=(3, 10))
 
         ctk.CTkLabel(row_quality, text="Export-Qualität:").pack(side="left", padx=(0, 6))
-        self.quality_var = ctk.StringVar(value="💎 High Quality (CRF 16 Studio)")
+        self.quality_var = ctk.StringVar(value="High Quality (CRF 16 Studio)")
         ctk.CTkComboBox(
             row_quality,
             values=[
-                "💎 High Quality (CRF 16 Studio)",
-                "👑 Maximal (CRF 14 Glasklar)",
-                "⚡ Ultra-Fast (CRF 20 Schnell)"
+                "High Quality (CRF 16 Studio)",
+                "Maximal (CRF 14 Glasklar)",
+                "Ultra-Fast (CRF 20 Schnell)"
             ],
             variable=self.quality_var,
             width=230
@@ -370,28 +587,40 @@ class EditMakerApp(ctk.CTk):
         preset_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
         preset_row.pack(fill="x", padx=12, pady=3)
 
-        ctk.CTkLabel(preset_row, text="Effekt-Preset:").pack(side="left", padx=(0, 8))
-        self.eff_preset_var = ctk.StringVar(value="Cinematic Flow (Punch, Shake & Warm Bloom)")
-        self.combo_preset = ctk.CTkComboBox(
+        ctk.CTkLabel(preset_row, text="Effekt-Stil:").pack(side="left", padx=(0, 8))
+        self.combo_fx_style = ctk.StringVar(value="Impact-Combo (Gleichzeitig auf Beat-Hits gestapelt)")
+        ctk.CTkComboBox(
             preset_row,
             values=[
-                "Cinematic Flow (Punch, Shake & Warm Bloom)",
-                "Hype & Action (Alle Effekte aktiv)",
-                "Clean / Minimal (Nur Cuts & dezent)",
-                "Benutzerdefiniert"
+                "Impact-Combo (Gleichzeitig auf Beat-Hits gestapelt)",
+                "Zufällig wechselnd (Ein Effekt pro Cut)",
+                "Dezent & Sanft (Nur weiche Übergänge)"
             ],
-            variable=self.eff_preset_var,
-            command=self.on_preset_changed,
-            width=290
-        )
-        self.combo_preset.pack(side="left", padx=5)
+            variable=self.combo_fx_style,
+            width=390
+        ).pack(side="left", padx=5)
 
         self.fx_cinematic_lut = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             preset_row,
-            text="🎬 Cinematic S-Curve Contrast & Color Pop",
+            text="Cinematic S-Curve Contrast & Color Pop",
             variable=self.fx_cinematic_lut
         ).pack(side="left", padx=(15, 5))
+
+        # Intensity Slider Row
+        intensity_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        intensity_row.pack(fill="x", padx=12, pady=(4, 2))
+
+        self.lbl_fx_intensity = ctk.CTkLabel(intensity_row, text="Effekt-Intensität: 100% (Recoil & Bloom)", width=280, anchor="w")
+        self.lbl_fx_intensity.pack(side="left", padx=(0, 10))
+
+        self.slider_fx_intensity = ctk.CTkSlider(
+            intensity_row,
+            from_=20, to=200,
+            command=lambda v: self.lbl_fx_intensity.configure(text=f"Effekt-Intensität: {int(v)}% (Recoil & Bloom)")
+        )
+        self.slider_fx_intensity.set(100)
+        self.slider_fx_intensity.pack(side="left", fill="x", expand=True, padx=5)
 
         eff_grid = ctk.CTkFrame(effects_frame, fg_color="transparent")
         eff_grid.pack(fill="x", padx=12, pady=(6, 10))
@@ -401,16 +630,18 @@ class EditMakerApp(ctk.CTk):
         self.fx_punch_zoom = ctk.BooleanVar(value=True)
         self.fx_slow_push = ctk.BooleanVar(value=True)
         self.fx_rgb_shock = ctk.BooleanVar(value=True)
+        self.fx_vignette = ctk.BooleanVar(value=True)
         self.fx_speedramp = ctk.BooleanVar(value=True)
 
-        ctk.CTkCheckBox(eff_grid, text="💥 Bass-Shake (OpenCV Recoil)", variable=self.fx_shake, command=self._set_custom_preset).grid(row=0, column=0, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="✨ Studio Bloom-Flash (Warm)", variable=self.fx_bloom_flash, command=self._set_custom_preset).grid(row=0, column=1, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="🔍 Punch-Zoom (Optischer Ease)", variable=self.fx_punch_zoom, command=self._set_custom_preset).grid(row=0, column=2, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="🎥 Slow Push-In (Sanfte Fahrt)", variable=self.fx_slow_push, command=self._set_custom_preset).grid(row=1, column=0, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="⚡ RGB-Shockwave (Aberration)", variable=self.fx_rgb_shock, command=self._set_custom_preset).grid(row=1, column=1, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="🚀 Speed-Ramp (Sync-Safe)", variable=self.fx_speedramp, command=self._set_custom_preset).grid(row=1, column=2, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Bass-Shake (Rotations-Tilt & Recoil)", variable=self.fx_shake).grid(row=0, column=0, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Exposure Bloom-Flash (Highlight-Burst)", variable=self.fx_bloom_flash).grid(row=0, column=1, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Punch-Zoom (Optischer Ease)", variable=self.fx_punch_zoom).grid(row=0, column=2, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Radial RGB-Aberration (Linsenzerlegung)", variable=self.fx_rgb_shock).grid(row=1, column=0, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Cinematic Vignette (Dunkler Randfokus)", variable=self.fx_vignette).grid(row=1, column=1, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Slow Push-In (Sanfte Kamerafahrt)", variable=self.fx_slow_push).grid(row=1, column=2, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Speed-Ramp (Sync-Safe Velocity)", variable=self.fx_speedramp).grid(row=2, column=0, sticky="w", padx=8, pady=3)
 
-        # 8. Dark Triad Spinning Overlay Frame
+        # 8. Spinning Overlay Frame
         overlay_frame = ctk.CTkFrame(self.main_container)
         overlay_frame.pack(fill="x", pady=5)
 
@@ -420,7 +651,7 @@ class EditMakerApp(ctk.CTk):
         self.enable_overlay_var = ctk.BooleanVar(value=False)
         self.chk_overlay = ctk.CTkCheckBox(
             overlay_header,
-            text="🌀 Spinning Overlay aktivieren (Dark Triad / Sigma Style)",
+            text="Spinning Bild-Overlay aktivieren",
             variable=self.enable_overlay_var,
             command=self._toggle_overlay_ui,
             font=("Arial", 14, "bold")
@@ -435,7 +666,7 @@ class EditMakerApp(ctk.CTk):
 
         self.btn_select_overlay = ctk.CTkButton(
             row_ov1,
-            text="🖼 Overlay-Bild wählen (PNG/JPG)",
+            text="Overlay-Bild wählen (PNG/JPG)",
             command=self.select_overlay_image,
             width=220
         )
@@ -450,9 +681,9 @@ class EditMakerApp(ctk.CTk):
 
         ctk.CTkLabel(row_ov2, text="Start-Zeitpunkt:").pack(side="left", padx=(0, 8))
         self.overlay_start_mode = ctk.StringVar(value="drop")
-        ctk.CTkRadioButton(row_ov2, text="🔥 Ab Beat-Drop (Automatisch)", variable=self.overlay_start_mode, value="drop").pack(side="left", padx=6)
-        ctk.CTkRadioButton(row_ov2, text="⏱ Ab bestimmter Zeit", variable=self.overlay_start_mode, value="custom").pack(side="left", padx=6)
-        ctk.CTkRadioButton(row_ov2, text="♾ Von Anfang an", variable=self.overlay_start_mode, value="start").pack(side="left", padx=6)
+        ctk.CTkRadioButton(row_ov2, text="Ab Beat-Drop (Automatisch)", variable=self.overlay_start_mode, value="drop").pack(side="left", padx=6)
+        ctk.CTkRadioButton(row_ov2, text="Ab bestimmter Zeit", variable=self.overlay_start_mode, value="custom").pack(side="left", padx=6)
+        ctk.CTkRadioButton(row_ov2, text="Von Anfang an", variable=self.overlay_start_mode, value="start").pack(side="left", padx=6)
 
         self.row_ov_slider = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
         self.row_ov_slider.pack(fill="x", padx=12, pady=2)
@@ -472,7 +703,7 @@ class EditMakerApp(ctk.CTk):
             row_ov3,
             values=[
                 "Wechselt zum Takt (Animiert)",
-                "🎯 In der Mitte (Zentriert)",
+                "In der Mitte (Zentriert)",
                 "Oben Links",
                 "Oben Rechts",
                 "Unten Links",
@@ -539,7 +770,7 @@ class EditMakerApp(ctk.CTk):
 
         self.btn_generate = ctk.CTkButton(
             btn_row_action,
-            text="🚀 Video Rendern (Pro Studio Engine)",
+            text="Video Rendern (Pro Studio Engine)",
             command=self.start_generation,
             fg_color="#1f8a4c",
             hover_color="#176b3b",
@@ -550,7 +781,7 @@ class EditMakerApp(ctk.CTk):
 
         self.btn_cancel = ctk.CTkButton(
             btn_row_action,
-            text="🛑 Abbrechen",
+            text="Abbrechen",
             command=self.cancel_generation,
             fg_color="#8b1e1e",
             hover_color="#631414",
@@ -577,7 +808,7 @@ class EditMakerApp(ctk.CTk):
         self.post_action_frame = ctk.CTkFrame(bottom_frame, fg_color="transparent")
         self.btn_open_folder = ctk.CTkButton(
             self.post_action_frame,
-            text="📂 Ordner im Explorer öffnen",
+            text="Ordner im Explorer öffnen",
             command=self.open_output_folder,
             fg_color="#2b719e",
             hover_color="#1f5375",
@@ -587,7 +818,7 @@ class EditMakerApp(ctk.CTk):
 
         self.btn_play_video = ctk.CTkButton(
             self.post_action_frame,
-            text="▶ Video abspielen",
+            text="Video abspielen",
             command=self.play_output_video,
             fg_color="#2563eb",
             hover_color="#1d4ed8",
@@ -611,36 +842,151 @@ class EditMakerApp(ctk.CTk):
             self.lbl_overlay_name.configure(text=os.path.basename(path), text_color="#38bdf8")
 
     # =====================================================================
-    # Preset & Effect Helpers
+    # Preset & Profile Management
     # =====================================================================
-    def on_preset_changed(self, choice):
-        if "Cinematic Flow" in choice:
-            self.fx_shake.set(True)
-            self.fx_bloom_flash.set(True)
-            self.fx_punch_zoom.set(True)
-            self.fx_slow_push.set(True)
-            self.fx_rgb_shock.set(False)
-            self.fx_speedramp.set(True)
-            self.fx_cinematic_lut.set(True)
-        elif "Hype & Action" in choice:
-            self.fx_shake.set(True)
-            self.fx_bloom_flash.set(True)
-            self.fx_punch_zoom.set(True)
-            self.fx_slow_push.set(True)
-            self.fx_rgb_shock.set(True)
-            self.fx_speedramp.set(True)
-            self.fx_cinematic_lut.set(True)
-        elif "Clean / Minimal" in choice:
-            self.fx_shake.set(False)
-            self.fx_bloom_flash.set(True)
-            self.fx_punch_zoom.set(False)
-            self.fx_slow_push.set(False)
-            self.fx_rgb_shock.set(False)
-            self.fx_speedramp.set(False)
-            self.fx_cinematic_lut.set(False)
+    def on_profile_selected(self, choice):
+        if choice in self.all_presets:
+            self.apply_preset_dict(self.all_presets[choice])
 
-    def _set_custom_preset(self):
-        self.eff_preset_var.set("Benutzerdefiniert")
+    def get_current_settings_dict(self):
+        return {
+            "mode": self.mode_var.get(),
+            "pace": self.pace_var.get(),
+            "orientation": self.orient_var.get(),
+            "scale_mode": self.scale_mode_var.get(),
+            "fps": int(self.fps_var.get()),
+            "quality": self.quality_var.get(),
+            "resolution": self.res_var.get(),
+            "clip_audio": self.clip_audio_var.get(),
+            "fade_out": self.fade_out_var.get(),
+            "combo_style": self.combo_fx_style.get(),
+            "fx_intensity": int(self.slider_fx_intensity.get()),
+            "fx_shake": self.fx_shake.get(),
+            "fx_bloom_flash": self.fx_bloom_flash.get(),
+            "fx_punch_zoom": self.fx_punch_zoom.get(),
+            "fx_slow_push": self.fx_slow_push.get(),
+            "fx_rgb_shock": self.fx_rgb_shock.get(),
+            "fx_vignette": self.fx_vignette.get(),
+            "fx_speedramp": self.fx_speedramp.get(),
+            "fx_cinematic_lut": self.fx_cinematic_lut.get(),
+            "enable_overlay": self.enable_overlay_var.get(),
+            "overlay_corner": self.overlay_corner_var.get(),
+            "overlay_size": self.overlay_size_var.get(),
+            "overlay_speed": float(self.slider_ov_speed.get()),
+            "overlay_opacity": float(self.slider_ov_opacity.get()),
+            "overlay_start_mode": self.overlay_start_mode.get(),
+            "overlay_circle": self.overlay_circle_cut_var.get()
+        }
+
+    def apply_preset_dict(self, data):
+        if not isinstance(data, dict):
+            return
+        if "mode" in data: self.mode_var.set(data["mode"])
+        if "pace" in data: self.pace_var.set(data["pace"])
+        if "orientation" in data: self.orient_var.set(data["orientation"])
+        if "scale_mode" in data: self.scale_mode_var.set(data["scale_mode"])
+        if "fps" in data: self.fps_var.set(int(data["fps"]))
+        if "quality" in data: self.quality_var.set(data["quality"])
+        if "resolution" in data: self.res_var.set(data["resolution"])
+        if "clip_audio" in data: self.clip_audio_var.set(data["clip_audio"])
+        if "fade_out" in data: self.fade_out_var.set(bool(data["fade_out"]))
+        if "combo_style" in data: self.combo_fx_style.set(data["combo_style"])
+        if "fx_intensity" in data:
+            val = float(data["fx_intensity"])
+            self.slider_fx_intensity.set(val)
+            self.lbl_fx_intensity.configure(text=f"Effekt-Intensität: {int(val)}% (Recoil & Bloom)")
+        if "fx_shake" in data: self.fx_shake.set(bool(data["fx_shake"]))
+        if "fx_bloom_flash" in data: self.fx_bloom_flash.set(bool(data["fx_bloom_flash"]))
+        if "fx_punch_zoom" in data: self.fx_punch_zoom.set(bool(data["fx_punch_zoom"]))
+        if "fx_slow_push" in data: self.fx_slow_push.set(bool(data["fx_slow_push"]))
+        if "fx_rgb_shock" in data: self.fx_rgb_shock.set(bool(data["fx_rgb_shock"]))
+        if "fx_vignette" in data: self.fx_vignette.set(bool(data["fx_vignette"]))
+        if "fx_speedramp" in data: self.fx_speedramp.set(bool(data["fx_speedramp"]))
+        if "fx_cinematic_lut" in data: self.fx_cinematic_lut.set(bool(data["fx_cinematic_lut"]))
+        if "enable_overlay" in data:
+            self.enable_overlay_var.set(bool(data["enable_overlay"]))
+            self._toggle_overlay_ui()
+        if "overlay_corner" in data: self.overlay_corner_var.set(data["overlay_corner"])
+        if "overlay_size" in data: self.overlay_size_var.set(data["overlay_size"])
+        if "overlay_speed" in data:
+            spd = float(data["overlay_speed"])
+            self.slider_ov_speed.set(spd)
+            self.lbl_ov_speed.configure(text=f"Dreh-Speed: {spd:.1f}x (Umdr./s)")
+        if "overlay_opacity" in data:
+            op = float(data["overlay_opacity"])
+            self.slider_ov_opacity.set(op)
+            self.lbl_ov_opacity.configure(text=f"Deckkraft: {int(op)}%")
+        if "overlay_start_mode" in data: self.overlay_start_mode.set(data["overlay_start_mode"])
+        if "overlay_circle" in data: self.overlay_circle_cut_var.set(bool(data["overlay_circle"]))
+
+    def save_current_as_profile(self):
+        dialog = ctk.CTkInputDialog(title="Profil speichern", text="Name für das neue Profil:")
+        name = dialog.get_input()
+        if name and name.strip():
+            name = name.strip()
+            self.all_presets[name] = self.get_current_settings_dict()
+            self._save_presets_to_disk()
+            values = list(self.all_presets.keys())
+            self.combo_profile.configure(values=values)
+            self.profile_var.set(name)
+            self.set_status(f"Profil '{name}' erfolgreich gespeichert.", 0.0)
+
+    def import_profile_json(self):
+        path = filedialog.askopenfilename(
+            title="Profil aus JSON-Datei laden",
+            filetypes=[("JSON-Dateien", "*.json"), ("Alle Dateien", "*.*")]
+        )
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    if "mode" in data or "fps" in data:
+                        base_name = os.path.splitext(os.path.basename(path))[0]
+                        self.all_presets[base_name] = data
+                        self._save_presets_to_disk()
+                        self.combo_profile.configure(values=list(self.all_presets.keys()))
+                        self.profile_var.set(base_name)
+                        self.apply_preset_dict(data)
+                        self.set_status(f"Profil aus '{os.path.basename(path)}' geladen.", 0.0)
+                    else:
+                        self.all_presets.update(data)
+                        self._save_presets_to_disk()
+                        self.combo_profile.configure(values=list(self.all_presets.keys()))
+                        self.set_status("Preset-Bundle importiert.", 0.0)
+            except Exception as e:
+                self.show_error("Fehler", f"Konnte Profil nicht laden:\n{e}")
+
+    def export_profile_json(self):
+        path = filedialog.asksaveasfilename(
+            title="Aktuelles Profil exportieren",
+            defaultextension=".json",
+            filetypes=[("JSON-Dateien", "*.json")]
+        )
+        if path:
+            try:
+                current_data = self.get_current_settings_dict()
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(current_data, f, indent=4, ensure_ascii=False)
+                self.set_status(f"Profil nach '{os.path.basename(path)}' exportiert.", 0.0)
+            except Exception as e:
+                self.show_error("Fehler", f"Export fehlgeschlagen:\n{e}")
+
+    def delete_current_profile(self):
+        cur = self.profile_var.get()
+        if cur in DEFAULT_PRESETS:
+            messagebox.showinfo("Hinweis", f"Das Standard-Profil '{cur}' kann nicht gelöscht werden.")
+            return
+        if cur in self.all_presets:
+            del self.all_presets[cur]
+            self._save_presets_to_disk()
+            values = list(self.all_presets.keys())
+            self.combo_profile.configure(values=values)
+            new_sel = values[0] if values else "Standard"
+            self.profile_var.set(new_sel)
+            if new_sel in self.all_presets:
+                self.apply_preset_dict(self.all_presets[new_sel])
+            self.set_status(f"Profil '{cur}' gelöscht.", 0.0)
 
     # =====================================================================
     # Thread-Safe UI Update Helpers
@@ -649,51 +995,95 @@ class EditMakerApp(ctk.CTk):
         def _update():
             self.lbl_status.configure(text=text)
             if progress is not None:
-                p_clamped = max(0.0, min(1.0, float(progress)))
+                p_clamped = max(0.0, min(1.0, progress))
                 self.progress_bar.set(p_clamped)
                 self.lbl_pct.configure(text=f"{int(p_clamped * 100)}%")
         self.after(0, _update)
 
-    def show_info(self, title, msg):
-        self.after(0, lambda: messagebox.showinfo(title, msg))
-
     def show_error(self, title, msg):
         self.after(0, lambda: messagebox.showerror(title, msg))
 
-    def show_warning(self, title, msg):
-        self.after(0, lambda: messagebox.showwarning(title, msg))
+    def show_info(self, title, msg):
+        self.after(0, lambda: messagebox.showinfo(title, msg))
 
     # =====================================================================
-    # Post-Export Actions
+    # Media Selection & Preview
     # =====================================================================
-    def open_output_folder(self):
-        if self.last_rendered_path and os.path.exists(self.last_rendered_path):
-            norm_p = os.path.normpath(self.last_rendered_path)
-            subprocess.Popen(f'explorer /select,"{norm_p}"')
+    def select_videos(self):
+        paths = filedialog.askopenfilenames(
+            title="Wähle Videos oder Bilder aus",
+            filetypes=[
+                ("Medien-Dateien", "*.mp4 *.mov *.avi *.mkv *.png *.jpg *.jpeg *.webp *.bmp"),
+                ("Video-Dateien", "*.mp4 *.mov *.avi *.mkv"),
+                ("Bilder", "*.png *.jpg *.jpeg *.webp *.bmp"),
+                ("Alle Dateien", "*.*")
+            ]
+        )
+        if paths:
+            new_paths = [p for p in paths if p not in self.video_paths]
+            self.video_paths.extend(new_paths)
+            self._update_media_listbox()
 
-    def play_output_video(self):
-        if self.last_rendered_path and os.path.exists(self.last_rendered_path):
+    def clear_videos(self):
+        self.video_paths = []
+        self._update_media_listbox()
+
+    def _update_media_listbox(self):
+        self.media_listbox.configure(state="normal")
+        self.media_listbox.delete("1.0", "end")
+        count = len(self.video_paths)
+        if count == 0:
+            self.media_listbox.insert("1.0", "Noch keine Dateien gewählt. Unterstützt MP4, MOV, MKV, AVI, PNG, JPG, WEBP...")
+            self.lbl_videos_count.configure(text="0 Dateien ausgewählt", text_color="gray")
+        else:
+            names = [f"[{i+1}] {os.path.basename(p)}" for i, p in enumerate(self.video_paths)]
+            self.media_listbox.insert("1.0", "\n".join(names))
+            self.lbl_videos_count.configure(text=f"{count} Dateien bereit", text_color="#38bdf8")
+        self.media_listbox.configure(state="disabled")
+
+    def select_audio(self):
+        path = filedialog.askopenfilename(
+            title="Wähle eine Musik-Datei",
+            filetypes=[("Audio-Dateien", "*.mp3 *.wav *.ogg *.aac *.flac *.m4a"), ("Alle Dateien", "*.*")]
+        )
+        if path:
+            self.audio_path = path
             try:
-                os.startfile(self.last_rendered_path)
-            except Exception as e:
-                self.show_error("Fehler", f"Konnte Video nicht abspielen:\n{e}")
+                probe = AudioFileClip(path)
+                self.audio_duration = float(probe.duration)
+                probe.close()
+            except Exception:
+                try:
+                    self.audio_duration = float(librosa.get_duration(path=path))
+                except Exception as e:
+                    self.show_error("Fehler", f"Konnte Audio-Dauer nicht ermitteln:\n{e}")
+                    return
 
-    # =====================================================================
-    # Sliders & Audio Preview
-    # =====================================================================
+            self.slider_start.configure(to=self.audio_duration)
+            self.slider_end.configure(to=self.audio_duration)
+            self.slider_start.set(0)
+            self.slider_end.set(self.audio_duration)
+            self.lbl_start.configure(text="Start: 0.0s")
+            self.lbl_end.configure(text=f"Ende: {self.audio_duration:.1f}s")
+            self.lbl_audio_status.configure(
+                text=f"{os.path.basename(path)} ({self.audio_duration:.1f}s)",
+                text_color="#38bdf8"
+            )
+            self.btn_audio_preview.configure(state="normal")
+
     def update_start_lbl(self, val):
+        val = float(val)
+        if val >= self.slider_end.get():
+            val = max(0, self.slider_end.get() - 0.5)
+            self.slider_start.set(val)
         self.lbl_start.configure(text=f"Start: {val:.1f}s")
-        if val > self.slider_end.get():
-            self.slider_end.set(val)
-            self.lbl_end.configure(text=f"Ende: {val:.1f}s")
-        self.stop_audio_preview()
 
     def update_end_lbl(self, val):
+        val = float(val)
+        if val <= self.slider_start.get():
+            val = min(self.audio_duration, self.slider_start.get() + 0.5)
+            self.slider_end.set(val)
         self.lbl_end.configure(text=f"Ende: {val:.1f}s")
-        if val < self.slider_start.get():
-            self.slider_start.set(val)
-            self.lbl_start.configure(text=f"Start: {val:.1f}s")
-        self.stop_audio_preview()
 
     def toggle_audio_preview(self):
         if self.is_preview_playing:
@@ -706,193 +1096,117 @@ class EditMakerApp(ctk.CTk):
             return
         start_t = self.slider_start.get()
         end_t = self.slider_end.get()
-        if start_t >= end_t:
-            return
+        dur = max(0.1, end_t - start_t)
 
+        temp_preview = os.path.join(tempfile.gettempdir(), "autoedit_preview_temp.wav")
         try:
-            pygame.mixer.music.load(self.audio_path)
-            pygame.mixer.music.play(start=start_t)
+            cmd = [
+                self.ffmpeg_exe, "-y",
+                "-ss", f"{start_t:.3f}",
+                "-i", self.audio_path,
+                "-t", f"{dur:.3f}",
+                "-vn",
+                "-c:a", "pcm_s16le",
+                "-ar", "44100",
+                "-ac", "2",
+                temp_preview
+            ]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            pygame.mixer.music.load(temp_preview)
+            pygame.mixer.music.play()
             self.is_preview_playing = True
-            self.btn_audio_preview.configure(text="⏸ Stoppen", fg_color="#b83232", hover_color="#852424")
-            duration = end_t - start_t
-            threading.Thread(target=self._preview_watchdog, args=(duration,), daemon=True).start()
-        except Exception as e:
-            self.stop_audio_preview()
-            self.show_error("Preview Fehler", f"Konnte Audio-Vorschau nicht starten:\n{e}")
+            self.btn_audio_preview.configure(text="Pause", fg_color="#c026d3", hover_color="#9333ea")
 
-    def _preview_watchdog(self, duration):
-        t0 = time.perf_counter()
-        while self.is_preview_playing:
-            time.sleep(0.05)
-            if time.perf_counter() - t0 >= duration:
-                self.after(0, self.stop_audio_preview)
-                break
+            def check_finished():
+                if self.is_preview_playing and not pygame.mixer.music.get_busy():
+                    self.stop_audio_preview()
+                elif self.is_preview_playing:
+                    self.after(100, check_finished)
+
+            self.after(100, check_finished)
+        except Exception as e:
+            self.show_error("Preview-Fehler", f"Konnte Audio-Vorschau nicht abspielen:\n{e}")
+            self.stop_audio_preview()
 
     def stop_audio_preview(self):
-        if self.is_preview_playing:
-            self.is_preview_playing = False
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
-        self.btn_audio_preview.configure(text="▶ Vorhören", fg_color="#2b719e", hover_color="#1f5375")
+        try:
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
+        self.is_preview_playing = False
+        self.btn_audio_preview.configure(text="Vorhören", fg_color="#2b719e", hover_color="#1f5375")
 
     # =====================================================================
-    # Media & Audio Selection
-    # =====================================================================
-    def select_videos(self):
-        paths = filedialog.askopenfilenames(
-            title="Wähle Medien (Videos & Fotos)",
-            filetypes=[
-                ("Medien-Dateien", "*.mp4 *.avi *.mov *.mkv *.png *.jpg *.jpeg *.webp *.bmp"),
-                ("Alle Dateien", "*.*")
-            ]
-        )
-        if paths:
-            self.video_paths = list(paths)
-            self.source_image_cache.clear()
-            self.update_media_listbox()
-
-    def clear_videos(self):
-        self.video_paths = []
-        self.source_image_cache.clear()
-        self.update_media_listbox()
-
-    def update_media_listbox(self):
-        self.media_listbox.configure(state="normal")
-        self.media_listbox.delete("1.0", "end")
-        count = len(self.video_paths)
-        if count == 0:
-            self.lbl_videos_count.configure(text="0 Dateien ausgewählt", text_color="gray")
-            self.media_listbox.insert("1.0", "Noch keine Dateien gewählt.")
-        else:
-            self.lbl_videos_count.configure(text=f"{count} Dateien geladen", text_color="white")
-            lines = [f"{i+1:02d}. {os.path.basename(p)}" for i, p in enumerate(self.video_paths)]
-            self.media_listbox.insert("1.0", "\n".join(lines))
-        self.media_listbox.configure(state="disabled")
-
-    def select_audio(self):
-        self.stop_audio_preview()
-        path = filedialog.askopenfilename(
-            title="Song / Beat auswählen",
-            filetypes=[("Audio-Dateien", "*.mp3 *.wav *.ogg *.m4a *.aac *.flac"), ("Alle Dateien", "*.*")]
-        )
-        if path:
-            self.audio_path = path
-            filename = os.path.basename(path)
-            self.lbl_audio_status.configure(text=filename, text_color="white")
-            self.btn_audio_preview.configure(state="normal")
-
-            try:
-                clip = AudioFileClip(self.audio_path)
-                self.audio_duration = float(clip.duration)
-                clip.close()
-
-                self.slider_start.configure(to=self.audio_duration)
-                self.slider_end.configure(to=self.audio_duration)
-                self.slider_start.set(0)
-                self.slider_end.set(self.audio_duration)
-                self.update_start_lbl(0)
-                self.update_end_lbl(self.audio_duration)
-                self.slider_overlay_sec.configure(to=self.audio_duration)
-            except Exception as e:
-                self.show_error("Fehler", f"Konnte Audio nicht analysieren:\n{e}")
-
-    # =====================================================================
-    # Generation Trigger & Cancel
+    # Cancellation & Post-Actions
     # =====================================================================
     def cancel_generation(self):
         self.is_cancelled = True
-        self.btn_cancel.configure(state="disabled")
-        self.set_status("Abbrechen angefordert...", None)
+        self.set_status("Abbruch angefordert... Bereinige Prozesse.", 0.0)
 
+    def open_output_folder(self):
+        if self.last_rendered_path and os.path.exists(self.last_rendered_path):
+            folder = os.path.dirname(self.last_rendered_path)
+            subprocess.Popen(f'explorer /select,"{os.path.normpath(self.last_rendered_path)}"')
+        else:
+            self.show_error("Fehler", "Kein erstelltes Video gefunden.")
+
+    def play_output_video(self):
+        if self.last_rendered_path and os.path.exists(self.last_rendered_path):
+            os.startfile(self.last_rendered_path)
+        else:
+            self.show_error("Fehler", "Video-Datei existiert nicht.")
+
+    # =====================================================================
+    # Generation Workflow
+    # =====================================================================
     def start_generation(self):
-        self.stop_audio_preview()
-        self.is_cancelled = False
-        self.post_action_frame.pack_forget()
-
         if not self.video_paths:
-            messagebox.showwarning("Hinweis", "Bitte wähle mindestens ein Video oder Bild aus.")
+            self.show_error("Fehler", "Bitte wähle mindestens ein Video oder Bild aus.")
             return
         if not self.audio_path:
-            messagebox.showwarning("Hinweis", "Bitte wähle einen Song aus.")
-            return
-        if self.enable_overlay_var.get() and (not self.overlay_img_path or not os.path.exists(self.overlay_img_path)):
-            messagebox.showwarning("Hinweis", "Du hast das Spinning Overlay aktiviert, aber noch kein Overlay-Bild ausgewählt.")
+            self.show_error("Fehler", "Bitte wähle eine Musik-Datei aus.")
             return
 
         start_t = self.slider_start.get()
         end_t = self.slider_end.get()
-
-        if start_t >= end_t:
-            messagebox.showwarning("Hinweis", "Die Endzeit muss größer als die Startzeit sein.")
+        if end_t <= start_t:
+            self.show_error("Fehler", "Das Ende der Musik muss nach dem Start liegen.")
             return
-
-        self.set_status("Prüfe Mediendateien...", 0.02)
-        valid_paths = []
-        bad_paths = []
-        for vp in self.video_paths:
-            ext = os.path.splitext(vp)[1].lower()
-            try:
-                if ext in ['.png', '.jpg', '.jpeg', '.webp', '.bmp']:
-                    with PIL.Image.open(vp) as img:
-                        img.verify()
-                else:
-                    test = VideoFileClip(vp)
-                    _ = test.get_frame(0)
-                    test.close()
-                valid_paths.append(vp)
-            except Exception:
-                bad_paths.append(os.path.basename(vp))
-
-        if bad_paths:
-            messagebox.showwarning(
-                "Defekte Dateien übersprungen",
-                "Folgende Dateien konnten nicht geladen werden und werden übersprungen:\n\n" + "\n".join(bad_paths)
-            )
-
-        if not valid_paths:
-            messagebox.showerror("Fehler", "Keine lesbaren Mediendateien vorhanden.")
-            self.set_status("Bereit für Schnitt", 0.0)
-            return
-
-        self.video_paths = valid_paths
-        if self.shuffle_var.get():
-            random.shuffle(self.video_paths)
-        self.update_media_listbox()
 
         out_path = filedialog.asksaveasfilename(
-            title="Video speichern unter",
+            title="Video speichern als",
             defaultextension=".mp4",
             filetypes=[("MP4 Video", "*.mp4")]
         )
         if not out_path:
-            self.set_status("Bereit für Schnitt", 0.0)
             return
 
+        self.is_cancelled = False
         self.btn_generate.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
-        mode = self.mode_var.get()
+        self.post_action_frame.pack_forget()
 
-        if mode in ("auto", "onsets"):
-            self.set_status("Starte Schnitt-Pipeline...", 0.05)
+        if self.shuffle_var.get():
+            random.shuffle(self.video_paths)
+
+        mode = self.mode_var.get()
+        if mode == "manual":
+            self.open_manual_recorder(start_t, end_t, out_path)
+        else:
+            self.set_status("Starte Beat-Analyse & Vorbereitung...", 0.05)
             threading.Thread(
                 target=self.generate_edit,
                 args=(start_t, end_t, out_path, None, mode),
                 daemon=True
             ).start()
-        else:
-            self.start_manual_recording(start_t, end_t, out_path)
 
     # =====================================================================
-    # Manual Beat Recording (With Takt-Magnet)
+    # Manual Recording Mode (Takt-Magnet)
     # =====================================================================
-    def start_manual_recording(self, start_t, end_t, out_path):
-        self.set_status("Bereite Audio & Takt-Magnet vor...", 0.05)
+    def open_manual_recorder(self, start_t, end_t, out_path):
         total_duration = end_t - start_t
-
         temp_dir = tempfile.mkdtemp(prefix="autoedit_manual_")
-        master_audio_wav = os.path.join(temp_dir, "master_manual.wav")
+        master_audio_wav = os.path.join(temp_dir, "master_audio.wav")
 
         try:
             cmd = [
@@ -946,7 +1260,7 @@ class EditMakerApp(ctk.CTk):
         magnet_var = ctk.BooleanVar(value=True)
         chk_magnet = ctk.CTkCheckBox(
             rec_win,
-            text="🧲 Takt-Magnet aktiv (Klicks millimetergenau an Drum-Hits einrasten)",
+            text="Takt-Magnet aktiv (Klicks an Drum-Hits einrasten)",
             variable=magnet_var
         )
         chk_magnet.pack(pady=(0, 8))
@@ -1003,7 +1317,7 @@ class EditMakerApp(ctk.CTk):
             rec_win.focus_set()
             update_playback_clock()
 
-        btn_start = ctk.CTkButton(rec_win, text="▶ Aufnahme Starten", command=start_play, font=("Arial", 15, "bold"), height=40)
+        btn_start = ctk.CTkButton(rec_win, text="Aufnahme Starten", command=start_play, font=("Arial", 15, "bold"), height=40)
         btn_start.pack(pady=10)
 
         def on_close():
@@ -1077,11 +1391,22 @@ class EditMakerApp(ctk.CTk):
             elif "Ultra-Fast" in quality_str:
                 crf_val = "20"
                 preset_val = "ultrafast"
-            else:  # High Quality (Default)
+            else:
                 crf_val = "16"
                 preset_val = "veryfast"
 
             res_choice = self.res_var.get()
+
+            # Effect controls & intensity
+            fx_style = self.combo_fx_style.get()
+            intensity = float(self.slider_fx_intensity.get()) / 100.0
+            allow_shake = self.fx_shake.get()
+            allow_bloom = self.fx_bloom_flash.get()
+            allow_punch = self.fx_punch_zoom.get()
+            allow_push = self.fx_slow_push.get()
+            allow_rgb = self.fx_rgb_shock.get()
+            allow_vignette = self.fx_vignette.get()
+            allow_speedramp = self.fx_speedramp.get()
 
             # Spinning Overlay Variables
             has_overlay = self.enable_overlay_var.get() and self.overlay_img_path and os.path.exists(self.overlay_img_path)
@@ -1123,7 +1448,6 @@ class EditMakerApp(ctk.CTk):
                 y, sr = librosa.load(master_audio_path, sr=sr_target)
                 y_percussive = librosa.effects.percussive(y, margin=2.2)
 
-                # Multi-Band Onset Detection: Kicks (<280Hz) + Snare/Clap Transients (800-5500Hz)
                 env_low = librosa.onset.onset_strength(y=y_percussive, sr=sr, fmax=280)
                 env_high = librosa.onset.onset_strength(y=y_percussive, sr=sr, fmin=800, fmax=5500)
                 onset_env = env_low * 1.0 + env_high * 0.65
@@ -1140,20 +1464,18 @@ class EditMakerApp(ctk.CTk):
                 else:
                     self.set_status("Schritt 1/3: Berechne Multi-Band Takt & Backtrack-Attack...", 0.12)
                     tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
-                    # CRITICAL: Backtrack beat frames to the exact physical transient attack edge!
                     beat_frames = librosa.onset.onset_backtrack(beat_frames, energy=onset_env)
                     raw_beats = librosa.frames_to_time(beat_frames, sr=sr)
 
                     rms = librosa.feature.rms(y=y)[0]
                     mean_rms = float(np.mean(rms)) if len(rms) > 0 else 0.01
 
-                    # Intelligent Beat-Drop Detection: find maximum sub-bass energy jump after intro (>= 2.5s)
+                    # Beat-Drop Detection: find maximum sub-bass energy jump after intro (>= 2.5s)
                     diff_low = np.diff(env_low)
                     min_f = int(2.5 * sr / 512)
                     if len(diff_low) > min_f + 10:
                         drop_frame = min_f + int(np.argmax(diff_low[min_f:]))
                         drop_raw_time = float(librosa.frames_to_time(drop_frame, sr=sr))
-                        # Snap drop timestamp directly to the nearest beat time
                         nearest_idx = int(np.argmin(np.abs(np.array(raw_beats) - drop_raw_time)))
                         drop_timestamp = float(raw_beats[nearest_idx])
                     else:
@@ -1288,11 +1610,14 @@ class EditMakerApp(ctk.CTk):
 
             video_positions = {}
 
-            # Pre-build Spinning Token (Dark Triad Style)
+            # Precompute Vignette Mask
+            vignette_mask = _build_vignette_mask(tw, th) if allow_vignette else None
+
+            # Pre-build Spinning Token
             prepared_token = None
-            if "Groß (45%" in overlay_size_str:
+            if "Groß" in overlay_size_str or "Gross" in overlay_size_str:
                 token_ratio = 0.45
-            elif "Mittel (30%" in overlay_size_str:
+            elif "Mittel" in overlay_size_str:
                 token_ratio = 0.30
             else:
                 token_ratio = 0.20
@@ -1353,7 +1678,6 @@ class EditMakerApp(ctk.CTk):
                         height=target_h,
                     )
 
-            # In-Memory Cache for Image Clips
             def open_source(path):
                 ext_ = os.path.splitext(path)[1].lower()
                 if ext_ in ['.png', '.jpg', '.jpeg', '.webp', '.bmp']:
@@ -1392,76 +1716,79 @@ class EditMakerApp(ctk.CTk):
                 return sc
 
             # =========================================================
-            # OpenCV Hardware-Accelerated Modern Effect Suite
+            # Modern High-Impact Edit Effect Engine
             # =========================================================
-            # 1. Warm Studio Bloom Flash (Smooth Cubic Ease-Out)
-            def fx_bloom_flash(clip, dur):
+            def apply_pro_effects(clip, dur, is_impact=True, active_effects=None):
+                if active_effects is None:
+                    active_effects = {"shake", "bloom", "punch", "rgb", "push"}
+
                 fd = min(0.14, dur)
-                def f(gf, t):
+                sd = min(0.20, dur)
+                rd = min(0.09, dur)
+
+                use_shake = allow_shake and ("shake" in active_effects) and is_impact
+                use_bloom = allow_bloom and ("bloom" in active_effects) and is_impact
+                use_punch = allow_punch and ("punch" in active_effects) and is_impact
+                use_rgb = allow_rgb and ("rgb" in active_effects) and is_impact
+                use_push = allow_push and ("push" in active_effects) and (not is_impact or dur > 0.6)
+
+                def process_frame(gf, t):
                     frame = gf(t)
-                    if t < fd:
-                        alpha = 0.58 * ((1.0 - (t / fd)) ** 3)
-                        # Warm golden-white tint [255, 252, 240]
-                        blend = frame.astype(np.float32) * (1.0 - alpha) + np.array([255, 252, 240], dtype=np.float32) * alpha
-                        return np.clip(blend, 0, 255).astype(np.uint8)
+
+                    # 1. Spatial Transformation: Punch Zoom + Rotational Tilt + Recoil displacement
+                    decay_zoom = ((max(0.0, 1.0 - (t / dur))) ** 3.0)
+                    cur_zoom = 1.0 + (0.13 * intensity * decay_zoom) if use_punch else 1.0
+                    if use_push:
+                        cur_zoom = 1.0 + (0.04 * (t / dur))
+
+                    ang = 0.0
+                    dx, dy = 0.0, 0.0
+                    if use_shake and t < sd:
+                        decay_shake = ((max(0.0, 1.0 - (t / sd))) ** 2.5)
+                        ang = np.sin(t * 38.0) * (2.2 * intensity) * decay_shake
+                        dx = (np.sin(t * 52.0) * 16.0 + np.sin(t * 22.0) * 8.0) * intensity * decay_shake
+                        dy = (np.cos(t * 44.0) * 12.0 + np.cos(t * 18.0) * 6.0) * intensity * decay_shake
+
+                    if abs(ang) > 0.01 or cur_zoom > 1.002 or abs(dx) > 0.5 or abs(dy) > 0.5:
+                        M = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), ang, cur_zoom)
+                        M[0, 2] += dx
+                        M[1, 2] += dy
+                        frame = cv2.warpAffine(frame, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+                    # 2. Exposure Bloom Flash (Highlight-Burst mit Farbtemperatur)
+                    if use_bloom and t < fd:
+                        decay_fl = ((max(0.0, 1.0 - (t / fd))) ** 2.2) * intensity
+                        gain = 1.0 + (0.90 * decay_fl)
+                        warm_tint = np.array([255, 246, 225], dtype=np.float32)
+                        boosted = frame.astype(np.float32) * gain + (warm_tint * (0.28 * decay_fl))
+                        frame = np.clip(boosted, 0, 255).astype(np.uint8)
+
+                    # 3. Radial Lens Chromatic Aberration (RGB-Linsenzerlegung)
+                    if use_rgb and t < rd:
+                        decay_rgb = ((max(0.0, 1.0 - (t / rd))) ** 2.0) * intensity
+                        if decay_rgb > 0.02:
+                            r_scale = 1.0 + (0.014 * decay_rgb)
+                            b_scale = 1.0 - (0.014 * decay_rgb)
+                            Mr = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), 0, r_scale)
+                            Mb = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), 0, b_scale)
+                            r_ch = cv2.warpAffine(frame[:, :, 0], Mr, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                            b_ch = cv2.warpAffine(frame[:, :, 2], Mb, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                            frame[:, :, 0] = r_ch
+                            frame[:, :, 2] = b_ch
+
+                    # 4. Cinematic Vignette
+                    if allow_vignette and vignette_mask is not None:
+                        frame = cv2.multiply(frame, vignette_mask, scale=1.0 / 255.0)
+
+                    # 5. Cinematic S-Curve Contrast & Color Pop LUT
+                    if apply_cinematic_lut:
+                        frame = cv2.LUT(frame, CINEMATIC_LUT)
+
                     return frame
-                return clip.fl(f)
 
-            # 2. Camera Shake with OpenCV Reflection (Zero Black Borders!)
-            def fx_camera_shake(clip, dur):
-                sd = min(0.18, dur)
-                def f(gf, t):
-                    frame = gf(t)
-                    if t < sd:
-                        decay = (1.0 - (t / sd)) ** 3
-                        dx = np.sin(t * 45.0) * 14.0 * decay
-                        dy = np.cos(t * 35.0) * 9.0 * decay
-                        M = np.float32([[1, 0, dx], [0, 1, dy]])
-                        return cv2.warpAffine(frame, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-                    return frame
-                return clip.fl(f)
+                return clip.fl(process_frame)
 
-            # 3. Optical Punch Zoom with OpenCV Ease-Out
-            def fx_punch_zoom(clip, dur, p=1.06):
-                def f(gf, t):
-                    decay = (1.0 - (t / dur)) ** 3
-                    s = 1.0 + (p - 1.0) * decay
-                    frame = gf(t)
-                    if s > 1.002:
-                        M = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), 0, s)
-                        return cv2.warpAffine(frame, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-                    return frame
-                return clip.fl(f)
-
-            # 4. Cinematic Slow Push-In
-            def fx_slow_push(clip, dur):
-                def f(gf, t):
-                    s = 1.0 + (0.035 * (t / dur))
-                    frame = gf(t)
-                    if s > 1.002:
-                        M = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), 0, s)
-                        return cv2.warpAffine(frame, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-                    return frame
-                return clip.fl(f)
-
-            # 5. Transient RGB Shockwave
-            def fx_rgb_shockwave(clip, dur):
-                sd = min(0.07, dur)
-                def f(gf, t):
-                    frame = gf(t).copy()
-                    if t < sd:
-                        shift = int(round(6.0 * (1.0 - t / sd)))
-                        if shift > 0:
-                            frame[:, :, 0] = np.roll(frame[:, :, 0], shift, axis=1)
-                            frame[:, :, 2] = np.roll(frame[:, :, 2], -shift, axis=1)
-                    return frame
-                return clip.fl(f)
-
-            # 6. Cinematic Color Grading LUT
-            def apply_color_lut(clip):
-                return clip.fl_image(lambda img: cv2.LUT(img, CINEMATIC_LUT))
-
-            # Dark Triad Spinning Overlay Compositor
+            # Spinning Overlay Compositor
             def apply_spinning_overlay(clip, cur_cut_idx, cut_global_start, dur):
                 if prepared_token is None:
                     return clip
@@ -1483,7 +1810,7 @@ class EditMakerApp(ctk.CTk):
                 elif "Unten Rechts" in overlay_corner_mode:
                     target_pos = corners[2]
                     prev_pos = corners[2]
-                else:  # Unten Links
+                else:
                     target_pos = corners[3]
                     prev_pos = corners[3]
 
@@ -1508,13 +1835,6 @@ class EditMakerApp(ctk.CTk):
                     return np.array(bg_pil)
 
                 return clip.fl(overlay_frame)
-
-            allow_shake = self.fx_shake.get()
-            allow_bloom = self.fx_bloom_flash.get()
-            allow_punch = self.fx_punch_zoom.get()
-            allow_push = self.fx_slow_push.get()
-            allow_rgb = self.fx_rgb_shock.get()
-            allow_speedramp = self.fx_speedramp.get()
 
             if "Dezent 15%" in clip_audio_setting:
                 clip_audio_vol = 0.15
@@ -1541,18 +1861,9 @@ class EditMakerApp(ctk.CTk):
                 cur_path = video_paths[clip_idx]
                 source_clip = open_source(cur_path)
 
-                # Modern Effect Selection
-                possible_fx = ["clean"]
-                if allow_bloom: possible_fx.append("bloom")
-                if allow_shake: possible_fx.append("shake")
-                if allow_punch: possible_fx.append("punch")
-                if allow_push and duration >= 0.5: possible_fx.append("push")
-                if allow_rgb: possible_fx.append("rgb")
-                if allow_speedramp and not isinstance(source_clip, ImageClip): possible_fx.append("speedramp")
-
-                chosen_fx = random.choice(possible_fx)
-
-                if chosen_fx == "speedramp":
+                # Determine effect mode for this clip
+                use_speedramp = allow_speedramp and not isinstance(source_clip, ImageClip) and (duration < 0.8) and (i % 3 == 0)
+                if use_speedramp:
                     speed_mult = 1.30
                     raw_cut = cut_source(source_clip, duration * speed_mult, cur_path)
                     sub_clip = fit_clip(raw_cut, tw, th).fx(vfx.speedx, speed_mult)
@@ -1564,26 +1875,23 @@ class EditMakerApp(ctk.CTk):
                     raw_cut = cut_source(source_clip, duration, cur_path)
                     sub_clip = fit_clip(raw_cut, tw, th)
 
-                    if chosen_fx == "bloom":
-                        sub_clip = fx_bloom_flash(sub_clip, duration)
-                    elif chosen_fx == "shake":
-                        sub_clip = fx_camera_shake(sub_clip, duration)
-                    elif chosen_fx == "punch":
-                        sub_clip = fx_punch_zoom(sub_clip, duration, 1.06)
-                    elif chosen_fx == "push":
-                        sub_clip = fx_slow_push(sub_clip, duration)
-                    elif chosen_fx == "rgb":
-                        sub_clip = fx_rgb_shockwave(sub_clip, duration)
+                # Determine active effects based on chosen style
+                if "Impact-Combo" in fx_style:
+                    # Coordinated impact combo stacked on beats
+                    sub_clip = apply_pro_effects(sub_clip, duration, is_impact=True)
+                elif "Zufällig" in fx_style:
+                    all_possible = ["shake", "bloom", "punch", "rgb", "push"]
+                    pick = {random.choice(all_possible)}
+                    sub_clip = apply_pro_effects(sub_clip, duration, is_impact=True, active_effects=pick)
+                else:
+                    # Dezent & Sanft
+                    sub_clip = apply_pro_effects(sub_clip, duration, is_impact=False, active_effects={"push", "bloom"})
 
-                # Apply Cinematic Color Grade LUT if active
-                if apply_cinematic_lut:
-                    sub_clip = apply_color_lut(sub_clip)
-
-                # Apply Spinning Overlay if drop threshold is reached
+                # Apply Spinning Overlay if trigger reached
                 if has_overlay and cut_global_start >= active_overlay_start:
                     sub_clip = apply_spinning_overlay(sub_clip, i, cut_global_start, duration)
 
-                # Safe audio handling
+                # Audio handling
                 seg_has_audio = False
                 if clip_audio_vol > 0.0:
                     try:
@@ -1638,85 +1946,64 @@ class EditMakerApp(ctk.CTk):
             concat_txt = os.path.join(temp_dir, "concat_list.txt")
             with open(concat_txt, "w", encoding="utf-8") as f:
                 for tp in temp_files:
-                    safe_p = tp.replace("\\", "/")
-                    f.write(f"file '{safe_p}'\n")
+                    f.write(f"file '{os.path.abspath(tp).replace(os.sep, '/')}'\n")
 
-            cmd = [
-                self.ffmpeg_exe,
-                "-y",
+            visual_concat_mp4 = os.path.join(temp_dir, "visual_concat.mp4")
+            cmd_concat = [
+                self.ffmpeg_exe, "-y",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", concat_txt,
-                "-i", master_audio_path,
+                "-c", "copy",
+                visual_concat_mp4
             ]
+            res_c = subprocess.run(cmd_concat, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res_c.returncode != 0:
+                cmd_concat_fallback = [
+                    self.ffmpeg_exe, "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", concat_txt,
+                    "-c:v", "libx264",
+                    "-preset", preset_val,
+                    "-crf", crf_val,
+                    visual_concat_mp4
+                ]
+                subprocess.run(cmd_concat_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
 
-            fade_duration = 0.8
-            fade_start = max(0.0, total_duration - fade_duration)
+            self.set_status("Schritt 3/3: Muxe unkomprimiertes Master-Audio & Fade-Out...", 0.95)
 
-            if clip_audio_vol > 0.0:
-                af_filter = f"[0:a]volume=1.0[a0];[1:a]volume=1.0[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2"
-                if enable_fade_out:
-                    af_filter += f",afade=t=out:st={fade_start:.3f}:d={fade_duration:.3f}[aout]"
-                else:
-                    af_filter += "[aout]"
-
-                cmd.extend([
-                    "-filter_complex", af_filter,
-                    "-map", "0:v:0",
-                    "-map", "[aout]",
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-b:a", "320k",
-                    "-shortest",
-                    out_path
-                ])
-            else:
-                if enable_fade_out:
-                    cmd.extend([
-                        "-map", "0:v:0",
-                        "-map", "1:a:0",
-                        "-c:v", "copy",
-                        "-c:a", "aac",
-                        "-b:a", "320k",
-                        "-af", f"afade=t=out:st={fade_start:.3f}:d={fade_duration:.3f}",
-                        "-shortest",
-                        out_path
-                    ])
-                else:
-                    cmd.extend([
-                        "-map", "0:v:0",
-                        "-map", "1:a:0",
-                        "-c:v", "copy",
-                        "-c:a", "aac",
-                        "-b:a", "320k",
-                        "-shortest",
-                        out_path
-                    ])
-
-            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if process.returncode != 0:
-                raise RuntimeError(f"FFmpeg Concat Fehler (Code {process.returncode}):\n{process.stderr}")
+            audio_filter = f"afade=t=out:st={max(0, total_duration - 0.8):.2f}:d=0.8" if enable_fade_out else "anull"
+            final_cmd = [
+                self.ffmpeg_exe, "-y",
+                "-i", visual_concat_mp4,
+                "-i", master_audio_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "320k",
+                "-af", audio_filter,
+                "-shortest",
+                out_path
+            ]
+            subprocess.run(final_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
 
             self.last_rendered_path = out_path
-            self.set_status("Fertig! Edit erfolgreich gerendert.", 1.0)
-            self.after(0, lambda: self.post_action_frame.pack(fill="x", padx=20, pady=(4, 10)))
-            self.show_info("Erfolg", f"Dein Edit ({fps} FPS, {tw}x{th}) wurde in Studio-Qualität perfekt synchron gespeichert unter:\n{out_path}")
+            self.set_status(f"Export erfolgreich abgeschlossen: {os.path.basename(out_path)}", 1.0)
+            self.show_info("Fertig", f"Video erfolgreich gespeichert unter:\n{out_path}")
+            self.after(0, lambda: self.post_action_frame.pack(fill="x", padx=20, pady=(6, 10)))
 
         except InterruptedError:
-            self.set_status("Rendern abgebrochen.", 0.0)
-            self.show_info("Abgebrochen", "Der Rendervorgang wurde sauber beendet.")
+            self.set_status("Rendern abgebrochen. Keine Datei erstellt.", 0.0)
         except Exception as e:
-            err = traceback.format_exc()
-            print(err)
-            self.set_status("Fehler beim Rendern aufgetreten!", 0.0)
-            self.show_error("Fehler", f"Ein Fehler ist aufgetreten:\n{e}")
+            traceback.print_exc()
+            self.set_status(f"Fehler: {e}", 0.0)
+            self.show_error("Fehler", f"Fehler beim Rendern:\n{traceback.format_exc()}")
         finally:
-            self.btn_generate.configure(state="normal")
-            self.btn_cancel.configure(state="disabled")
-            try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
-                pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            self.after(0, lambda: self.btn_generate.configure(state="normal"))
+            self.after(0, lambda: self.btn_cancel.configure(state="disabled"))
 
 
 if __name__ == "__main__":

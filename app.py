@@ -110,6 +110,123 @@ def _build_vignette_mask(w, h):
     vig_u8 = np.clip(vig * 255.0, 0, 255).astype(np.uint8)
     return cv2.merge([vig_u8, vig_u8, vig_u8])
 
+def ai_detect_beat_drop(y, sr, total_dur):
+    """
+    KI-basierte Struktur-Analyse & Beat-Drop Erkennung (Change-Point Detection).
+
+    Kandidaten-Punkte kommen aus zwei Quellen:
+      1. Agglomerative Segmentierung (Chroma-CQT + MFCC) -> musikalische Abschnitte
+      2. Steile Energiesprünge im gleitenden Mehrband-Profil
+
+    Bewertet wird jeder Kandidat als Energie-Sprung ueber die Grenze hinweg
+    (RMS, Sub-Bass 30-160 Hz, Air 4-11 kHz). Der Drop ist die Grenze, die in den
+    lautesten nachfolgenden Abschnitt fuehrt - nicht die mit dem groessten
+    relativen Sprung. Beginnt der Track mit einer stillen Intro, gewinnt der
+    erste echte Drop (Intro-Regel).
+    """
+    if total_dur < 3.5:
+        return 0.0
+
+    try:
+        hop = 1024
+        n_fft = 2048
+
+        spec = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+        band_sub = spec[(freqs >= 30) & (freqs < 160)].mean(axis=0)
+        band_air = spec[(freqs >= 4000) & (freqs < 11000)].mean(axis=0)
+        rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+
+        n_frames = len(rms)
+        frames_t = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=hop)
+
+        smooth_k = max(1, int(sr / hop * 0.8) | 1)
+
+        def _band(arr):
+            sm = np.convolve(arr, np.ones(smooth_k) / smooth_k, mode="same")
+            return sm / (float(np.percentile(sm, 95)) + 1e-9)
+
+        p_rms, p_sub, p_air = _band(rms), _band(band_sub), _band(band_air)
+
+        candidates = set()
+        try:
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop)
+            n_clusters = max(3, min(8, int(total_dur // 7)))
+            bounds = librosa.segment.agglomerative(np.vstack([chroma, mfcc]), n_clusters)
+            candidates.update(
+                round(float(b), 2)
+                for b in librosa.frames_to_time(bounds, sr=sr, hop_length=hop)
+            )
+        except Exception:
+            pass
+
+        for i in range(4, n_frames - 8):
+            a_r = float(np.mean(p_rms[i - 4:i + 5]))
+            b_r = float(np.mean(p_rms[i:i + 9]))
+            a_s = float(np.mean(p_sub[i - 4:i + 5]))
+            b_s = float(np.mean(p_sub[i:i + 9]))
+            if b_r > a_r * 1.25 and b_s > a_s * 1.12:
+                candidates.add(round(float(frames_t[i]), 2))
+
+        candidates = sorted(c for c in candidates if 1.2 < c < total_dur * 0.90)
+        if not candidates:
+            return 0.0
+
+        win = max(6, int(sr / hop * 1.2))
+
+        def _window_mean(arr, i0, i1):
+            i0, i1 = max(0, i0), min(n_frames, i1)
+            return float(np.mean(arr[i0:i1])) if i1 > i0 else 0.0
+
+        def _measure(t_cand):
+            i = int(np.searchsorted(frames_t, t_cand))
+            pre_r, post_r = _window_mean(p_rms, i - win, i), _window_mean(p_rms, i, i + win)
+            pre_s, post_s = _window_mean(p_sub, i - win, i), _window_mean(p_sub, i, i + win)
+            pre_a, post_a = _window_mean(p_air, i - win, i), _window_mean(p_air, i, i + win)
+            jump = (max(0.0, post_r - pre_r)
+                    + 1.2 * max(0.0, post_s - pre_s)
+                    + 0.5 * max(0.0, post_a - pre_a))
+            after = post_r + 0.45 * post_s + 0.15 * post_a
+            before = pre_r + 0.45 * pre_s + 0.15 * pre_a
+            return jump, after, before
+
+        valid = []
+        best = None
+        for c in candidates:
+            jump, after, before = _measure(c)
+            if jump < 0.50:
+                continue
+            if after <= before * 1.05 or after < 0.45:
+                continue
+            valid.append(c)
+            level = after - 0.35 * before
+            if best is None or level > best[0]:
+                best = (level, c)
+
+        if best is None:
+            return 0.0
+
+        drop_t = best[1]
+
+        if valid:
+            first = valid[0]
+            i_first = int(np.searchsorted(frames_t, first))
+            pre_intro = _window_mean(p_rms, max(0, i_first - 2 * win), max(1, i_first))
+            if pre_intro < 0.35:
+                drop_t = first
+
+        idx = int(np.searchsorted(frames_t, drop_t))
+        lo, hi = max(0, idx - 6), min(n_frames, idx + 7)
+        attack = 0.6 * p_sub[lo:hi] + 0.4 * p_rms[lo:hi]
+        if len(attack) > 0:
+            drop_t = float(frames_t[lo + int(np.argmax(attack))])
+
+        return float(drop_t)
+    except Exception as e:
+        print(f"[AI Audio Error] {e}")
+        return 0.0
+
 # Default Presets
 DEFAULT_PRESETS = {
     "TikTok Montage / Beat Drop": {
@@ -251,6 +368,7 @@ class EditMakerApp(ctk.CTk):
         self.overlay_img_path = None
         self.source_image_cache = {}
         self.ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        self.current_preview_file = None
 
         self.presets_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
         self.all_presets = self._load_presets_from_disk()
@@ -494,6 +612,13 @@ class EditMakerApp(ctk.CTk):
         )
         self.combo_pace.pack(side="left", padx=5)
 
+        self.ai_audio_analysis_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            pace_row,
+            text="KI-Struktur- & Drum-Isolation (ML-Cluster)",
+            variable=self.ai_audio_analysis_var
+        ).pack(side="left", padx=(15, 5))
+
         # 5. Format, Skalierung & Qualität
         format_frame = ctk.CTkFrame(self.main_container)
         format_frame.pack(fill="x", pady=5)
@@ -588,11 +713,12 @@ class EditMakerApp(ctk.CTk):
         preset_row.pack(fill="x", padx=12, pady=3)
 
         ctk.CTkLabel(preset_row, text="Effekt-Stil:").pack(side="left", padx=(0, 8))
-        self.combo_fx_style = ctk.StringVar(value="Impact-Combo (Gleichzeitig auf Beat-Hits gestapelt)")
+        self.combo_fx_style = ctk.StringVar(value="Dynamischer Rhythmus-Flow (Abwechslungsreich)")
         ctk.CTkComboBox(
             preset_row,
             values=[
-                "Impact-Combo (Gleichzeitig auf Beat-Hits gestapelt)",
+                "Dynamischer Rhythmus-Flow (Abwechslungsreich)",
+                "Impact-Combo (Volle Power auf jeden Beat)",
                 "Zufällig wechselnd (Ein Effekt pro Cut)",
                 "Dezent & Sanft (Nur weiche Übergänge)"
             ],
@@ -680,17 +806,26 @@ class EditMakerApp(ctk.CTk):
         row_ov2.pack(fill="x", padx=12, pady=4)
 
         ctk.CTkLabel(row_ov2, text="Start-Zeitpunkt:").pack(side="left", padx=(0, 8))
-        self.overlay_start_mode = ctk.StringVar(value="drop")
-        ctk.CTkRadioButton(row_ov2, text="Ab Beat-Drop (Automatisch)", variable=self.overlay_start_mode, value="drop").pack(side="left", padx=6)
-        ctk.CTkRadioButton(row_ov2, text="Ab bestimmter Zeit", variable=self.overlay_start_mode, value="custom").pack(side="left", padx=6)
-        ctk.CTkRadioButton(row_ov2, text="Von Anfang an", variable=self.overlay_start_mode, value="start").pack(side="left", padx=6)
+        self.overlay_start_mode = ctk.StringVar(value="custom")
+        ctk.CTkRadioButton(row_ov2, text="Ab Beat-Drop / Sekunde", variable=self.overlay_start_mode, value="custom").pack(side="left", padx=6)
+        ctk.CTkRadioButton(row_ov2, text="Von Anfang an (0.0s)", variable=self.overlay_start_mode, value="start").pack(side="left", padx=6)
+
+        self.btn_detect_drop = ctk.CTkButton(
+            row_ov2, text="Auto-Drop finden", width=130, height=26,
+            fg_color="#334155", hover_color="#475569",
+            command=self.auto_detect_drop_ui
+        )
+        self.btn_detect_drop.pack(side="right", padx=(6, 0))
 
         self.row_ov_slider = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
         self.row_ov_slider.pack(fill="x", padx=12, pady=2)
-        self.lbl_overlay_sec = ctk.CTkLabel(self.row_ov_slider, text="Start bei: 10.0s", width=110, anchor="w")
+        self.lbl_overlay_sec = ctk.CTkLabel(self.row_ov_slider, text="Start bei: 29.0s", width=120, anchor="w")
         self.lbl_overlay_sec.pack(side="left")
-        self.slider_overlay_sec = ctk.CTkSlider(self.row_ov_slider, from_=0, to=60, command=lambda v: self.lbl_overlay_sec.configure(text=f"Start bei: {v:.1f}s"))
-        self.slider_overlay_sec.set(10.0)
+        self.slider_overlay_sec = ctk.CTkSlider(
+            self.row_ov_slider, from_=0, to=120,
+            command=lambda v: self.lbl_overlay_sec.configure(text=f"Start bei: {v:.1f}s")
+        )
+        self.slider_overlay_sec.set(29.0)
         self.slider_overlay_sec.pack(side="right", fill="x", expand=True, padx=5)
 
         # Row 3: Placement & Size
@@ -839,7 +974,44 @@ class EditMakerApp(ctk.CTk):
         )
         if path:
             self.overlay_img_path = path
+            self.enable_overlay_var.set(True)
+            self._toggle_overlay_ui()
             self.lbl_overlay_name.configure(text=os.path.basename(path), text_color="#38bdf8")
+
+    def auto_detect_drop_ui(self):
+        if not self.audio_path or not os.path.exists(self.audio_path):
+            self.show_error("Hinweis", "Bitte zuerst eine Audio-Datei auswählen.")
+            return
+
+        start_t = self.slider_start.get()
+        end_t = self.slider_end.get()
+        dur = max(1.0, end_t - start_t)
+
+        def _worker():
+            try:
+                t0 = time.time()
+                self.set_status("KI analysiert Musikstruktur & Drop-Cluster...", 0.3)
+                y, sr = librosa.load(self.audio_path, offset=start_t, duration=dur, sr=22050)
+                best_time = ai_detect_beat_drop(y, sr, len(y) / sr)
+                elapsed = time.time() - t0
+
+                def _apply():
+                    clamped_t = max(0.0, min(dur, best_time))
+                    self.slider_overlay_sec.set(clamped_t)
+                    self.lbl_overlay_sec.configure(text=f"Start bei: {clamped_t:.1f}s")
+                    self.overlay_start_mode.set("custom")
+                    if best_time <= 0.05:
+                        self.set_status("KI: Kein eindeutiger Drop gefunden - bitte manuell setzen.", 0.0)
+                    else:
+                        self.set_status(
+                            f"KI: Beat-Drop erkannt bei {clamped_t:.1f}s ({elapsed:.1f}s Analyse)", 0.0
+                        )
+
+                self.after(0, _apply)
+            except Exception as e:
+                self.after(0, lambda: self.set_status(f"Fehler bei Drop-Erkennung: {e}", 0.0))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # =====================================================================
     # Preset & Profile Management
@@ -1065,6 +1237,8 @@ class EditMakerApp(ctk.CTk):
             self.slider_end.set(self.audio_duration)
             self.lbl_start.configure(text="Start: 0.0s")
             self.lbl_end.configure(text=f"Ende: {self.audio_duration:.1f}s")
+            if hasattr(self, 'slider_overlay_sec'):
+                self.slider_overlay_sec.configure(to=self.audio_duration)
             self.lbl_audio_status.configure(
                 text=f"{os.path.basename(path)} ({self.audio_duration:.1f}s)",
                 text_color="#38bdf8"
@@ -1094,22 +1268,23 @@ class EditMakerApp(ctk.CTk):
     def start_audio_preview(self):
         if not self.audio_path or not os.path.exists(self.audio_path):
             return
+
+        self.stop_audio_preview()
+
         start_t = self.slider_start.get()
         end_t = self.slider_end.get()
         dur = max(0.5, end_t - start_t)
 
-        temp_preview = os.path.join(tempfile.gettempdir(), "autoedit_preview_temp.wav")
-
-        # Delete stale temp file if it exists (may be locked from previous run)
         try:
-            if os.path.exists(temp_preview):
-                os.remove(temp_preview)
+            fd, temp_preview = tempfile.mkstemp(prefix="autoedit_prev_", suffix=".wav")
+            os.close(fd)
+            self.current_preview_file = temp_preview
         except Exception:
-            temp_preview = os.path.join(tempfile.gettempdir(), f"autoedit_prev_{int(time.time())}.wav")
+            temp_preview = os.path.join(tempfile.gettempdir(), f"autoedit_prev_{int(time.time() * 1000)}.wav")
+            self.current_preview_file = temp_preview
 
         extracted_ok = False
         try:
-            # Attempt 1: fast seek (input-side -ss, works for most files)
             cmd = [
                 self.ffmpeg_exe, "-y",
                 "-ss", f"{start_t:.3f}",
@@ -1122,8 +1297,9 @@ class EditMakerApp(ctk.CTk):
                 temp_preview
             ]
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if res.returncode != 0:
-                # Attempt 2: slow seek (output-side -ss, more compatible)
+            if res.returncode == 0 and os.path.exists(temp_preview) and os.path.getsize(temp_preview) > 44:
+                extracted_ok = True
+            else:
                 cmd2 = [
                     self.ffmpeg_exe, "-y",
                     "-i", self.audio_path,
@@ -1136,19 +1312,20 @@ class EditMakerApp(ctk.CTk):
                     temp_preview
                 ]
                 res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                extracted_ok = (res2.returncode == 0)
-            else:
-                extracted_ok = True
+                if res2.returncode == 0 and os.path.exists(temp_preview) and os.path.getsize(temp_preview) > 44:
+                    extracted_ok = True
         except Exception:
             extracted_ok = False
 
         try:
-            if extracted_ok and os.path.exists(temp_preview) and os.path.getsize(temp_preview) > 44:
+            if extracted_ok:
                 pygame.mixer.music.load(temp_preview)
             else:
-                # Fallback: load original file directly via pygame (no trimming)
                 pygame.mixer.music.load(self.audio_path)
-                pygame.mixer.music.set_pos(start_t)
+                try:
+                    pygame.mixer.music.set_pos(start_t)
+                except Exception:
+                    pass
 
             pygame.mixer.music.play()
             self.is_preview_playing = True
@@ -1162,15 +1339,21 @@ class EditMakerApp(ctk.CTk):
 
             self.after(100, check_finished)
         except Exception as e:
-            self.show_error("Preview-Fehler", f"Konnte Audio nicht laden:\n{os.path.basename(self.audio_path)}\n\n{e}")
+            self.show_error("Preview-Fehler", f"Konnte Audio nicht abspielen:\n{os.path.basename(self.audio_path)}\n\n{e}")
             self.stop_audio_preview()
-
 
     def stop_audio_preview(self):
         try:
             pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
         except Exception:
             pass
+        if getattr(self, "current_preview_file", None) and os.path.exists(self.current_preview_file):
+            try:
+                os.remove(self.current_preview_file)
+            except Exception:
+                pass
+            self.current_preview_file = None
         self.is_preview_playing = False
         self.btn_audio_preview.configure(text="Vorhören", fg_color="#2b719e", hover_color="#1f5375")
 
@@ -1363,6 +1546,7 @@ class EditMakerApp(ctk.CTk):
             is_playing = False
             try:
                 pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
             except Exception:
                 pass
             rec_win.destroy()
@@ -1508,15 +1692,19 @@ class EditMakerApp(ctk.CTk):
                     rms = librosa.feature.rms(y=y)[0]
                     mean_rms = float(np.mean(rms)) if len(rms) > 0 else 0.01
 
-                    # Beat-Drop Detection: find maximum sub-bass energy jump after intro (>= 2.5s)
-                    diff_low = np.diff(env_low)
-                    min_f = int(2.5 * sr / 512)
-                    if len(diff_low) > min_f + 10:
-                        drop_frame = min_f + int(np.argmax(diff_low[min_f:]))
-                        drop_raw_time = float(librosa.frames_to_time(drop_frame, sr=sr))
-                        nearest_idx = int(np.argmin(np.abs(np.array(raw_beats) - drop_raw_time)))
-                        drop_timestamp = float(raw_beats[nearest_idx])
-                    else:
+                    # KI-basierte Beat-Drop & Struktur-Erkennung
+                    try:
+                        if self.ai_audio_analysis_var.get():
+                            drop_raw_time = ai_detect_beat_drop(y, sr, total_duration)
+                        else:
+                            drop_raw_time = 0.0
+
+                        if drop_raw_time > 0.05 and len(raw_beats) > 0:
+                            nearest_idx = int(np.argmin(np.abs(np.array(raw_beats) - drop_raw_time)))
+                            drop_timestamp = float(raw_beats[nearest_idx])
+                        else:
+                            drop_timestamp = max(0.0, drop_raw_time)
+                    except Exception:
                         drop_timestamp = 0.0
 
                     beat_times = [float(b) for b in raw_beats]
@@ -1599,14 +1787,17 @@ class EditMakerApp(ctk.CTk):
             durations = [fc / float(fps) for fc in frame_counts]
 
             if has_overlay:
-                if overlay_start_type == "drop":
-                    active_overlay_start = drop_timestamp
-                elif overlay_start_type == "custom":
-                    active_overlay_start = max(0.0, float(self.slider_overlay_sec.get()) - start_t)
-                else:
+                if overlay_start_type == "start":
                     active_overlay_start = 0.0
+                elif overlay_start_type == "drop":
+                    active_overlay_start = drop_timestamp if drop_timestamp > 0 else max(0.0, float(self.slider_overlay_sec.get()))
+                else:
+                    active_overlay_start = max(0.0, min(total_duration, float(self.slider_overlay_sec.get())))
             else:
                 active_overlay_start = 999999.0
+
+            if has_overlay:
+                print(f"[Overlay] Aktiv ab {active_overlay_start:.2f}s (Trigger: {overlay_start_type}, Drop: {drop_timestamp:.2f}s)")
 
             # -------------------------------------------------------------
             # STEP 2: Video-Zuschnitt & Hardware-Beschleunigte Effekte
@@ -1754,38 +1945,64 @@ class EditMakerApp(ctk.CTk):
                 return sc
 
             # =========================================================
-            # Modern High-Impact Edit Effect Engine
+            # Modern High-Impact Edit Effect Engine (Rhythm-Aware)
             # =========================================================
-            def apply_pro_effects(clip, dur, is_impact=True, active_effects=None):
-                if active_effects is None:
-                    active_effects = {"shake", "bloom", "punch", "rgb", "push"}
-
+            def apply_pro_effects(clip, dur, cut_idx=0):
                 fd = min(0.14, dur)
-                sd = min(0.20, dur)
-                rd = min(0.09, dur)
+                sd = min(0.18, dur)
+                rd = min(0.08, dur)
 
-                use_shake = allow_shake and ("shake" in active_effects) and is_impact
-                use_bloom = allow_bloom and ("bloom" in active_effects) and is_impact
-                use_punch = allow_punch and ("punch" in active_effects) and is_impact
-                use_rgb = allow_rgb and ("rgb" in active_effects) and is_impact
-                use_push = allow_push and ("push" in active_effects) and (not is_impact or dur > 0.6)
+                # Determine Motion Cadence for this cut:
+                if "Dezent" in fx_style:
+                    motion_type = 1 if (cut_idx % 2 == 0) else 3
+                elif "Volle Power" in fx_style or "Hardcore" in fx_style:
+                    motion_type = 0
+                elif "Zufällig" in fx_style:
+                    motion_type = random.choice([0, 1, 2, 3])
+                else:
+                    # Dynamischer Rhythmus-Flow (Abwechslungsreich):
+                    # 0 = Downbeat Heavy (Tilt Shake + Punch + Flash)
+                    # 1 = Crisp Optical Punch-Zoom (NO wobble!) + Flash
+                    # 2 = Directional Pan Snap (Snap slide, NO tilt wobble) + RGB
+                    # 3 = Cinematic Slow Push-In (Smooth glide, NO shake)
+                    motion_type = cut_idx % 4
+
+                # Alternating direction signs
+                tilt_sign = 1.0 if ((cut_idx // 2) % 2 == 0) else -1.0
+                pan_sign = 1.0 if (cut_idx % 2 == 0) else -1.0
+
+                use_punch = allow_punch and (motion_type in [0, 1])
+                use_shake = allow_shake and (motion_type == 0) and (dur >= 0.22)
+                use_snap = (motion_type == 2) and (dur >= 0.18)
+                use_bloom = allow_bloom and (motion_type in [0, 1, 2])
+                use_rgb = allow_rgb and (motion_type in [0, 2])
+                use_push = allow_push and (motion_type == 3 or dur > 0.60)
 
                 def process_frame(gf, t):
                     frame = gf(t)
 
-                    # 1. Spatial Transformation: Punch Zoom + Rotational Tilt + Recoil displacement
+                    # 1. Spatial Transformation
                     decay_zoom = ((max(0.0, 1.0 - (t / dur))) ** 3.0)
-                    cur_zoom = 1.0 + (0.13 * intensity * decay_zoom) if use_punch else 1.0
+                    cur_zoom = 1.0
+                    if use_punch:
+                        cur_zoom += (0.11 * intensity * decay_zoom)
                     if use_push:
-                        cur_zoom = 1.0 + (0.04 * (t / dur))
+                        cur_zoom += (0.038 * (t / dur))
 
                     ang = 0.0
                     dx, dy = 0.0, 0.0
+
+                    # Heavy Recoil Shake with alternating Tilt (Downbeats only!)
                     if use_shake and t < sd:
-                        decay_shake = ((max(0.0, 1.0 - (t / sd))) ** 2.5)
-                        ang = np.sin(t * 38.0) * (2.2 * intensity) * decay_shake
-                        dx = (np.sin(t * 52.0) * 16.0 + np.sin(t * 22.0) * 8.0) * intensity * decay_shake
-                        dy = (np.cos(t * 44.0) * 12.0 + np.cos(t * 18.0) * 6.0) * intensity * decay_shake
+                        decay_shake = ((max(0.0, 1.0 - (t / sd))) ** 2.4)
+                        ang = np.sin(t * 36.0) * (2.2 * intensity * tilt_sign) * decay_shake
+                        dx = np.sin(t * 48.0) * (14.0 * intensity * pan_sign) * decay_shake
+                        dy = np.cos(t * 38.0) * (10.0 * intensity) * decay_shake
+
+                    # Directional Snap (Fast horizontal whip, zero tilt!)
+                    elif use_snap and t < 0.12:
+                        decay_snap = ((max(0.0, 1.0 - (t / 0.12))) ** 3.0)
+                        dx = (20.0 * intensity * pan_sign) * decay_snap
 
                     if abs(ang) > 0.01 or cur_zoom > 1.002 or abs(dx) > 0.5 or abs(dy) > 0.5:
                         M = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), ang, cur_zoom)
@@ -1793,12 +2010,12 @@ class EditMakerApp(ctk.CTk):
                         M[1, 2] += dy
                         frame = cv2.warpAffine(frame, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-                    # 2. Exposure Bloom Flash (Highlight-Burst mit Farbtemperatur)
+                    # 2. Exposure Bloom Flash (Highlight-Burst)
                     if use_bloom and t < fd:
                         decay_fl = ((max(0.0, 1.0 - (t / fd))) ** 2.2) * intensity
-                        gain = 1.0 + (0.90 * decay_fl)
+                        gain = 1.0 + (0.85 * decay_fl)
                         warm_tint = np.array([255, 246, 225], dtype=np.float32)
-                        boosted = frame.astype(np.float32) * gain + (warm_tint * (0.28 * decay_fl))
+                        boosted = frame.astype(np.float32) * gain + (warm_tint * (0.25 * decay_fl))
                         frame = np.clip(boosted, 0, 255).astype(np.uint8)
 
                     # 3. Radial Lens Chromatic Aberration (RGB-Linsenzerlegung)
@@ -1856,6 +2073,11 @@ class EditMakerApp(ctk.CTk):
                     frame = gf(t)
                     global_t = cut_global_start + t
 
+                    # Frame-accurate: only show overlay once trigger is reached
+                    if global_t < active_overlay_start:
+                        return frame
+
+                    rel_t = global_t - active_overlay_start
                     slide_dur = 0.12
                     if "Wechselt zum Takt" in overlay_corner_mode and t < slide_dur and cur_cut_idx > 0:
                         prog = min(1.0, t / slide_dur)
@@ -1865,7 +2087,7 @@ class EditMakerApp(ctk.CTk):
                     else:
                         cx, cy = target_pos
 
-                    angle = (global_t * 360.0 * overlay_speed_val) % 360.0
+                    angle = (rel_t * 360.0 * overlay_speed_val) % 360.0
                     rotated = prepared_token.rotate(-angle, resample=PIL.Image.BILINEAR)
 
                     bg_pil = PIL.Image.fromarray(frame.astype(np.uint8))
@@ -1913,20 +2135,11 @@ class EditMakerApp(ctk.CTk):
                     raw_cut = cut_source(source_clip, duration, cur_path)
                     sub_clip = fit_clip(raw_cut, tw, th)
 
-                # Determine active effects based on chosen style
-                if "Impact-Combo" in fx_style:
-                    # Coordinated impact combo stacked on beats
-                    sub_clip = apply_pro_effects(sub_clip, duration, is_impact=True)
-                elif "Zufällig" in fx_style:
-                    all_possible = ["shake", "bloom", "punch", "rgb", "push"]
-                    pick = {random.choice(all_possible)}
-                    sub_clip = apply_pro_effects(sub_clip, duration, is_impact=True, active_effects=pick)
-                else:
-                    # Dezent & Sanft
-                    sub_clip = apply_pro_effects(sub_clip, duration, is_impact=False, active_effects={"push", "bloom"})
+                # Apply Pro Effects with diverse rhythmic cadence
+                sub_clip = apply_pro_effects(sub_clip, duration, cut_idx=i)
 
-                # Apply Spinning Overlay if trigger reached
-                if has_overlay and cut_global_start >= active_overlay_start:
+                # Apply Spinning Overlay if clip overlaps or is past active_overlay_start
+                if has_overlay and (cut_global_start + duration >= active_overlay_start):
                     sub_clip = apply_spinning_overlay(sub_clip, i, cut_global_start, duration)
 
                 # Audio handling

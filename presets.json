@@ -110,5 +110,33 @@
         "overlay_opacity": 100,
         "overlay_start_mode": "start",
         "overlay_circle": true
+    },
+    "edits1": {
+        "mode": "auto",
+        "pace": "1x (Jeder Takt)",
+        "orientation": "original",
+        "scale_mode": "fit",
+        "fps": 60,
+        "quality": "High Quality (CRF 16 Studio)",
+        "resolution": "Originalgröße der Dateien",
+        "clip_audio": "Stumm (100% Musik)",
+        "fade_out": true,
+        "combo_style": "Impact-Combo (Gleichzeitig auf Beat-Hits gestapelt)",
+        "fx_intensity": 118,
+        "fx_shake": true,
+        "fx_bloom_flash": false,
+        "fx_punch_zoom": true,
+        "fx_slow_push": true,
+        "fx_rgb_shock": true,
+        "fx_vignette": true,
+        "fx_speedramp": true,
+        "fx_cinematic_lut": false,
+        "enable_overlay": true,
+        "overlay_corner": "Oben Links",
+        "overlay_size": "Mittel (30% - Standard)",
+        "overlay_speed": 0.7764044943820225,
+        "overlay_opacity": 100.0,
+        "overlay_start_mode": "drop",
+        "overlay_circle": true
     }
 }

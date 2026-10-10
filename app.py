@@ -1096,10 +1096,20 @@ class EditMakerApp(ctk.CTk):
             return
         start_t = self.slider_start.get()
         end_t = self.slider_end.get()
-        dur = max(0.1, end_t - start_t)
+        dur = max(0.5, end_t - start_t)
 
         temp_preview = os.path.join(tempfile.gettempdir(), "autoedit_preview_temp.wav")
+
+        # Delete stale temp file if it exists (may be locked from previous run)
         try:
+            if os.path.exists(temp_preview):
+                os.remove(temp_preview)
+        except Exception:
+            temp_preview = os.path.join(tempfile.gettempdir(), f"autoedit_prev_{int(time.time())}.wav")
+
+        extracted_ok = False
+        try:
+            # Attempt 1: fast seek (input-side -ss, works for most files)
             cmd = [
                 self.ffmpeg_exe, "-y",
                 "-ss", f"{start_t:.3f}",
@@ -1111,8 +1121,35 @@ class EditMakerApp(ctk.CTk):
                 "-ac", "2",
                 temp_preview
             ]
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            pygame.mixer.music.load(temp_preview)
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode != 0:
+                # Attempt 2: slow seek (output-side -ss, more compatible)
+                cmd2 = [
+                    self.ffmpeg_exe, "-y",
+                    "-i", self.audio_path,
+                    "-ss", f"{start_t:.3f}",
+                    "-t", f"{dur:.3f}",
+                    "-vn",
+                    "-c:a", "pcm_s16le",
+                    "-ar", "44100",
+                    "-ac", "2",
+                    temp_preview
+                ]
+                res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                extracted_ok = (res2.returncode == 0)
+            else:
+                extracted_ok = True
+        except Exception:
+            extracted_ok = False
+
+        try:
+            if extracted_ok and os.path.exists(temp_preview) and os.path.getsize(temp_preview) > 44:
+                pygame.mixer.music.load(temp_preview)
+            else:
+                # Fallback: load original file directly via pygame (no trimming)
+                pygame.mixer.music.load(self.audio_path)
+                pygame.mixer.music.set_pos(start_t)
+
             pygame.mixer.music.play()
             self.is_preview_playing = True
             self.btn_audio_preview.configure(text="Pause", fg_color="#c026d3", hover_color="#9333ea")
@@ -1125,8 +1162,9 @@ class EditMakerApp(ctk.CTk):
 
             self.after(100, check_finished)
         except Exception as e:
-            self.show_error("Preview-Fehler", f"Konnte Audio-Vorschau nicht abspielen:\n{e}")
+            self.show_error("Preview-Fehler", f"Konnte Audio nicht laden:\n{os.path.basename(self.audio_path)}\n\n{e}")
             self.stop_audio_preview()
+
 
     def stop_audio_preview(self):
         try:

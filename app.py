@@ -2,23 +2,33 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import librosa
 import numpy as np
+import cv2
 from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips, CompositeVideoClip, ColorClip, vfx, ImageClip
 import os
 import threading
 import random
 import traceback
 import time
+import tempfile
+import subprocess
+import shutil
 import pygame
-
-# Patch for Pillow 10+ compatibility with MoviePy 1.0.3
+import imageio_ffmpeg
 import PIL.Image
+import PIL.ImageDraw
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+# =====================================================================
+# Compatibility Patches & OpenCV Optimization
+# =====================================================================
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     try:
         PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
     except AttributeError:
         PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 
-# Patch for MoviePy 1.0.3 "failed to read the first frame" bug (WhatsApp / variable framerate / delayed PTS videos)
 import moviepy.video.io.ffmpeg_reader as ffr
 _orig_read_frame = ffr.FFMPEG_VideoReader.read_frame
 def _robust_read_frame(self):
@@ -26,14 +36,12 @@ def _robust_read_frame(self):
         return _orig_read_frame(self)
     except IOError as e:
         if "failed to read the first frame" in str(e):
-            # Try seeking slightly into the video (0.1s) in case PTS / keyframe starts later
             try:
                 self.initialize(0.1)
                 self.pos = int(self.fps * 0.1 + 0.00001) + 1
                 return _orig_read_frame(self)
             except Exception:
                 pass
-            # If still failing, produce a blank frame so the pipeline doesn't crash
             w, h = self.size
             depth = getattr(self, 'depth', 3)
             blank = np.zeros((h, w, depth), dtype='uint8')
@@ -42,372 +50,1760 @@ def _robust_read_frame(self):
         raise
 ffr.FFMPEG_VideoReader.read_frame = _robust_read_frame
 
+# Patch for MoviePy 1.0.3 crop bug: prevent negative coordinate slicing
+import moviepy.video.fx.crop as mpy_crop
+def _safe_moviepy_crop(clip, x1=None, y1=None, x2=None, y2=None, width=None, height=None, x_center=None, y_center=None):
+    cw, ch = clip.size
+    if width is not None and x1 is not None: x2 = x1 + width
+    elif width is not None and x2 is not None: x1 = x2 - width
+    if height is not None and y1 is not None: y2 = y1 + height
+    elif height is not None and y2 is not None: y1 = y2 - height
+
+    if x_center is not None and width is not None:
+        x1 = x_center - width / 2.0
+        x2 = x_center + width / 2.0
+    if y_center is not None and height is not None:
+        y1 = y_center - height / 2.0
+        y2 = y_center + height / 2.0
+
+    if x1 is None: x1 = 0
+    if y1 is None: y1 = 0
+    if x2 is None: x2 = cw
+    if y2 is None: y2 = ch
+
+    tw_req = int(round(x2 - x1)) if width is None else int(round(width))
+    th_req = int(round(y2 - y1)) if height is None else int(round(height))
+    tw_req = max(1, min(cw, tw_req))
+    th_req = max(1, min(ch, th_req))
+
+    ix1 = max(0, min(cw - tw_req, int(round(x1))))
+    iy1 = max(0, min(ch - th_req, int(round(y1))))
+    ix2 = ix1 + tw_req
+    iy2 = iy1 + th_req
+
+    newclip = clip.fl_image(lambda pic: pic[iy1:iy2, ix1:ix2], apply_to=["mask"])
+    newclip.size = (tw_req, th_req)
+    newclip.w = tw_req
+    newclip.h = th_req
+    return newclip
+mpy_crop.crop = _safe_moviepy_crop
+
+# Ultra-fast SIMD resizer via OpenCV
+import moviepy.video.fx.resize as mpy_resize
+def _cv2_resizer(pic, newsize):
+    lx, ly = max(1, int(round(newsize[0]))), max(1, int(round(newsize[1])))
+    return cv2.resize(pic.astype(np.uint8), (lx, ly), interpolation=cv2.INTER_LINEAR)
+mpy_resize.resizer = _cv2_resizer
+
+# Pre-generate Cinematic S-Curve Contrast LUT
+_x_lut = np.linspace(0, 1, 256)
+_y_lut = 1.0 / (1.0 + np.exp(-9.0 * (_x_lut - 0.5)))
+_y_lut = (_y_lut - _y_lut.min()) / (_y_lut.max() - _y_lut.min())
+CINEMATIC_LUT = np.clip(_y_lut * 255.0, 0, 255).astype(np.uint8)
+
+def _build_vignette_mask(w, h):
+    X = cv2.getGaussianKernel(w, w * 0.48)
+    Y = cv2.getGaussianKernel(h, h * 0.48)
+    kernel = Y * X.T
+    kernel = kernel / kernel.max()
+    vig = np.clip(0.68 + 0.32 * kernel, 0, 1)
+    vig_u8 = np.clip(vig * 255.0, 0, 255).astype(np.uint8)
+    return cv2.merge([vig_u8, vig_u8, vig_u8])
+
+def ai_detect_beat_drop(y, sr, total_dur):
+    """
+    KI-basierte Struktur-Analyse & Beat-Drop Erkennung (Change-Point Detection).
+
+    Kandidaten-Punkte kommen aus zwei Quellen:
+      1. Agglomerative Segmentierung (Chroma-CQT + MFCC) -> musikalische Abschnitte
+      2. Steile Energiesprünge im gleitenden Mehrband-Profil
+
+    Bewertet wird jeder Kandidat als Energie-Sprung ueber die Grenze hinweg
+    (RMS, Sub-Bass 30-160 Hz, Air 4-11 kHz). Der Drop ist die Grenze, die in den
+    lautesten nachfolgenden Abschnitt fuehrt - nicht die mit dem groessten
+    relativen Sprung. Beginnt der Track mit einer stillen Intro, gewinnt der
+    erste echte Drop (Intro-Regel).
+    """
+    if total_dur < 3.5:
+        return 0.0
+
+    try:
+        hop = 1024
+        n_fft = 2048
+
+        spec = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+        band_sub = spec[(freqs >= 30) & (freqs < 160)].mean(axis=0)
+        band_air = spec[(freqs >= 4000) & (freqs < 11000)].mean(axis=0)
+        rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+
+        n_frames = len(rms)
+        frames_t = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=hop)
+
+        smooth_k = max(1, int(sr / hop * 0.8) | 1)
+
+        def _band(arr):
+            sm = np.convolve(arr, np.ones(smooth_k) / smooth_k, mode="same")
+            return sm / (float(np.percentile(sm, 95)) + 1e-9)
+
+        p_rms, p_sub, p_air = _band(rms), _band(band_sub), _band(band_air)
+
+        candidates = set()
+        try:
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop)
+            n_clusters = max(3, min(8, int(total_dur // 7)))
+            bounds = librosa.segment.agglomerative(np.vstack([chroma, mfcc]), n_clusters)
+            candidates.update(
+                round(float(b), 2)
+                for b in librosa.frames_to_time(bounds, sr=sr, hop_length=hop)
+            )
+        except Exception:
+            pass
+
+        for i in range(4, n_frames - 8):
+            a_r = float(np.mean(p_rms[i - 4:i + 5]))
+            b_r = float(np.mean(p_rms[i:i + 9]))
+            a_s = float(np.mean(p_sub[i - 4:i + 5]))
+            b_s = float(np.mean(p_sub[i:i + 9]))
+            if b_r > a_r * 1.25 and b_s > a_s * 1.12:
+                candidates.add(round(float(frames_t[i]), 2))
+
+        candidates = sorted(c for c in candidates if 1.2 < c < total_dur * 0.90)
+        if not candidates:
+            return 0.0
+
+        win = max(6, int(sr / hop * 1.2))
+
+        def _window_mean(arr, i0, i1):
+            i0, i1 = max(0, i0), min(n_frames, i1)
+            return float(np.mean(arr[i0:i1])) if i1 > i0 else 0.0
+
+        def _measure(t_cand):
+            i = int(np.searchsorted(frames_t, t_cand))
+            pre_r, post_r = _window_mean(p_rms, i - win, i), _window_mean(p_rms, i, i + win)
+            pre_s, post_s = _window_mean(p_sub, i - win, i), _window_mean(p_sub, i, i + win)
+            pre_a, post_a = _window_mean(p_air, i - win, i), _window_mean(p_air, i, i + win)
+            jump = (max(0.0, post_r - pre_r)
+                    + 1.2 * max(0.0, post_s - pre_s)
+                    + 0.5 * max(0.0, post_a - pre_a))
+            after = post_r + 0.45 * post_s + 0.15 * post_a
+            before = pre_r + 0.45 * pre_s + 0.15 * pre_a
+            return jump, after, before
+
+        valid = []
+        best = None
+        for c in candidates:
+            jump, after, before = _measure(c)
+            if jump < 0.50:
+                continue
+            if after <= before * 1.05 or after < 0.45:
+                continue
+            valid.append(c)
+            level = after - 0.35 * before
+            if best is None or level > best[0]:
+                best = (level, c)
+
+        if best is None:
+            return 0.0
+
+        drop_t = best[1]
+
+        if valid:
+            first = valid[0]
+            i_first = int(np.searchsorted(frames_t, first))
+            pre_intro = _window_mean(p_rms, max(0, i_first - 2 * win), max(1, i_first))
+            if pre_intro < 0.35:
+                drop_t = first
+
+        idx = int(np.searchsorted(frames_t, drop_t))
+        lo, hi = max(0, idx - 6), min(n_frames, idx + 7)
+        attack = 0.6 * p_sub[lo:hi] + 0.4 * p_rms[lo:hi]
+        if len(attack) > 0:
+            drop_t = float(frames_t[lo + int(np.argmax(attack))])
+
+        return float(drop_t)
+    except Exception as e:
+        print(f"[AI Audio Error] {e}")
+        return 0.0
+
+# Default Presets
+DEFAULT_PRESETS = {
+    "TikTok Montage / Beat Drop": {
+        "mode": "auto",
+        "pace": "1x (Jeder Takt)",
+        "orientation": "portrait",
+        "scale_mode": "fill",
+        "fps": 60,
+        "quality": "High Quality (CRF 16 Studio)",
+        "resolution": "1080p (Full HD)",
+        "clip_audio": "Stumm (100% Musik)",
+        "fade_out": True,
+        "combo_style": "Impact-Combo (Gleichzeitig auf Beat-Hits gestapelt)",
+        "fx_intensity": 130,
+        "fx_shake": True,
+        "fx_bloom_flash": True,
+        "fx_punch_zoom": True,
+        "fx_slow_push": True,
+        "fx_rgb_shock": True,
+        "fx_vignette": True,
+        "fx_speedramp": True,
+        "fx_cinematic_lut": True,
+        "enable_overlay": False,
+        "overlay_corner": "In der Mitte (Zentriert)",
+        "overlay_size": "Gross (45% Bildhoehe)",
+        "overlay_speed": 1.8,
+        "overlay_opacity": 100,
+        "overlay_start_mode": "drop",
+        "overlay_circle": True
+    },
+    "Velocity / Action Edit": {
+        "mode": "onsets",
+        "pace": "2x Schnell (Halber Takt)",
+        "orientation": "portrait",
+        "scale_mode": "fill",
+        "fps": 60,
+        "quality": "High Quality (CRF 16 Studio)",
+        "resolution": "1080p (Full HD)",
+        "clip_audio": "Dezent 15% (Killsounds/SFX)",
+        "fade_out": True,
+        "combo_style": "Impact-Combo (Gleichzeitig auf Beat-Hits gestapelt)",
+        "fx_intensity": 100,
+        "fx_shake": True,
+        "fx_bloom_flash": True,
+        "fx_punch_zoom": True,
+        "fx_slow_push": False,
+        "fx_rgb_shock": True,
+        "fx_vignette": True,
+        "fx_speedramp": True,
+        "fx_cinematic_lut": True,
+        "enable_overlay": False,
+        "overlay_corner": "Wechselt zum Takt (Animiert)",
+        "overlay_size": "Mittel (30% Bildhoehe)",
+        "overlay_speed": 1.2,
+        "overlay_opacity": 100,
+        "overlay_start_mode": "drop",
+        "overlay_circle": True
+    },
+    "Cinematic Flow & Aesthetic": {
+        "mode": "auto",
+        "pace": "1x (Jeder Takt)",
+        "orientation": "landscape",
+        "scale_mode": "fill",
+        "fps": 60,
+        "quality": "Maximal (CRF 14 Glasklar)",
+        "resolution": "1440p (2K Ultra Sharp)",
+        "clip_audio": "Stumm (100% Musik)",
+        "fade_out": True,
+        "combo_style": "Dezent & Sanft (Nur weiche Uebergaenge)",
+        "fx_intensity": 70,
+        "fx_shake": False,
+        "fx_bloom_flash": True,
+        "fx_punch_zoom": False,
+        "fx_slow_push": True,
+        "fx_rgb_shock": False,
+        "fx_vignette": True,
+        "fx_speedramp": False,
+        "fx_cinematic_lut": True,
+        "enable_overlay": False,
+        "overlay_corner": "Oben Rechts",
+        "overlay_size": "Kompakt (20% Bildhoehe)",
+        "overlay_speed": 1.0,
+        "overlay_opacity": 85,
+        "overlay_start_mode": "start",
+        "overlay_circle": True
+    },
+    "Clean & Minimal (Pure Cuts)": {
+        "mode": "auto",
+        "pace": "1x (Jeder Takt)",
+        "orientation": "portrait",
+        "scale_mode": "fill",
+        "fps": 60,
+        "quality": "High Quality (CRF 16 Studio)",
+        "resolution": "1080p (Full HD)",
+        "clip_audio": "Stumm (100% Musik)",
+        "fade_out": True,
+        "combo_style": "Dezent & Sanft (Nur weiche Uebergaenge)",
+        "fx_intensity": 40,
+        "fx_shake": False,
+        "fx_bloom_flash": False,
+        "fx_punch_zoom": False,
+        "fx_slow_push": False,
+        "fx_rgb_shock": False,
+        "fx_vignette": False,
+        "fx_speedramp": False,
+        "fx_cinematic_lut": False,
+        "enable_overlay": False,
+        "overlay_corner": "In der Mitte (Zentriert)",
+        "overlay_size": "Mittel (30% Bildhoehe)",
+        "overlay_speed": 1.0,
+        "overlay_opacity": 100,
+        "overlay_start_mode": "start",
+        "overlay_circle": True
+    }
+}
+
+# =====================================================================
+# Theme & Configuration
+# =====================================================================
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+
 
 class EditMakerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Auto Beat-Sync Edit Maker")
-        self.geometry("650x680")
-        self.resizable(False, False)
+        self.title("Auto Beat-Sync Edit Maker (Pro Studio Edition)")
+        self.geometry("820x970")
+        self.minsize(780, 820)
 
         self.video_paths = []
         self.audio_path = None
-        self.audio_duration = 0
+        self.audio_duration = 0.0
+        self.is_preview_playing = False
+        self.manual_times = []
+        self.is_cancelled = False
+        self.last_rendered_path = None
+        self.overlay_img_path = None
+        self.source_image_cache = {}
+        self.ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        self.current_preview_file = None
 
-        # Title
-        self.lbl_title = ctk.CTkLabel(self, text="Auto Edit Maker", font=("Arial", 28, "bold"))
-        self.lbl_title.pack(pady=(20, 10))
+        self.presets_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
+        self.all_presets = self._load_presets_from_disk()
 
-        # Video Selection
-        self.btn_select_videos = ctk.CTkButton(self, text="Select Video Clips", command=self.select_videos)
-        self.btn_select_videos.pack(pady=5)
+        pygame.mixer.init()
 
-        self.lbl_videos = ctk.CTkLabel(self, text="0 videos selected", text_color="gray")
-        self.lbl_videos.pack(pady=(0, 5))
+        self._build_ui()
 
-        # Shuffle option
-        self.shuffle_var = ctk.BooleanVar(value=False)
-        self.chk_shuffle = ctk.CTkCheckBox(self, text="Shuffle File Order", variable=self.shuffle_var)
-        self.chk_shuffle.pack(pady=(0, 10))
-
-        # Audio Selection
-        self.btn_select_audio = ctk.CTkButton(self, text="Select Audio (Song)", command=self.select_audio)
-        self.btn_select_audio.pack(pady=5)
-
-        self.lbl_audio = ctk.CTkLabel(self, text="No audio selected", text_color="gray")
-        self.lbl_audio.pack(pady=(0, 15))
-
-        # Audio Trim Sliders
-        self.frame_sliders = ctk.CTkFrame(self)
-        self.frame_sliders.pack(pady=10, fill="x", padx=40)
-        
-        self.lbl_sliders_title = ctk.CTkLabel(self.frame_sliders, text="Audio Selection (Start & End Time)", font=("Arial", 14, "bold"))
-        self.lbl_sliders_title.pack(pady=5)
-
-        self.lbl_start = ctk.CTkLabel(self.frame_sliders, text="Start Time: 0.0s")
-        self.lbl_start.pack()
-        self.slider_start = ctk.CTkSlider(self.frame_sliders, from_=0, to=100, command=self.update_start_lbl)
-        self.slider_start.set(0)
-        self.slider_start.pack(fill="x", padx=20, pady=(0, 10))
-
-        self.lbl_end = ctk.CTkLabel(self.frame_sliders, text="End Time: 0.0s")
-        self.lbl_end.pack()
-        self.slider_end = ctk.CTkSlider(self.frame_sliders, from_=0, to=100, command=self.update_end_lbl)
-        self.slider_end.pack(fill="x", padx=20, pady=(0, 10))
-
-        # Mode Switch
-        self.mode_var = ctk.StringVar(value="auto")
-        self.radio_auto = ctk.CTkRadioButton(self, text="Auto Mode (Kick Detection - Takt)", variable=self.mode_var, value="auto")
-        self.radio_auto.pack(pady=(5, 3))
-        self.radio_onsets = ctk.CTkRadioButton(self, text="Freeform Beat-Sync (Alle Beats/Hits - kein fester Takt)", variable=self.mode_var, value="onsets")
-        self.radio_onsets.pack(pady=(3, 3))
-        self.radio_manual = ctk.CTkRadioButton(self, text="Manual Mode (Press Spacebar to Cut)", variable=self.mode_var, value="manual")
-        self.radio_manual.pack(pady=(3, 10))
-
-        # Orientation Selection
-        self.frame_orient = ctk.CTkFrame(self)
-        self.frame_orient.pack(pady=5)
-        self.lbl_orient = ctk.CTkLabel(self.frame_orient, text="Output Format:", font=("Arial", 13, "bold"))
-        self.lbl_orient.pack(side="left", padx=(10, 8))
-        self.orient_var = ctk.StringVar(value="original")
-        for label, val in [("Original", "original"), ("Hochkant (9:16)", "portrait"), ("Quer (16:9)", "landscape")]:
-            ctk.CTkRadioButton(self.frame_orient, text=label, variable=self.orient_var, value=val).pack(side="left", padx=6)
-
-        # Generate Button
-        self.btn_generate = ctk.CTkButton(self, text="Generate Edit", command=self.start_generation, 
-                                          fg_color="green", hover_color="darkgreen", height=40, font=("Arial", 16, "bold"))
-        self.btn_generate.pack(pady=10)
-
-        # Status Label
-        self.lbl_status = ctk.CTkLabel(self, text="Ready", text_color="yellow")
-        self.lbl_status.pack()
-
-    def update_start_lbl(self, val):
-        self.lbl_start.configure(text=f"Start Time: {val:.1f}s")
-        if val > self.slider_end.get():
-            self.slider_end.set(val)
-            self.lbl_end.configure(text=f"End Time: {val:.1f}s")
-
-    def update_end_lbl(self, val):
-        self.lbl_end.configure(text=f"End Time: {val:.1f}s")
-        if val < self.slider_start.get():
-            self.slider_start.set(val)
-            self.lbl_start.configure(text=f"Start Time: {val:.1f}s")
-
-    def select_videos(self):
-        paths = filedialog.askopenfilenames(title="Select Media (Videos/Images)", filetypes=[("Media Files", "*.mp4 *.avi *.mov *.mkv *.png *.jpg *.jpeg *.webp"), ("All Files", "*.*")])
-        if paths:
-            self.video_paths = list(paths)
-            self.lbl_videos.configure(text=f"{len(self.video_paths)} media files selected", text_color="white")
-
-    def select_audio(self):
-        path = filedialog.askopenfilename(title="Select Audio", filetypes=[("Audio Files", "*.mp3 *.wav *.ogg *.m4a *.aac"), ("All Files", "*.*")])
-        if path:
-            self.audio_path = path
-            filename = os.path.basename(path)
-            self.lbl_audio.configure(text=f"Audio: {filename}", text_color="white")
-            
+    def _load_presets_from_disk(self):
+        presets = dict(DEFAULT_PRESETS)
+        if os.path.exists(self.presets_file):
             try:
-                clip = AudioFileClip(self.audio_path)
-                self.audio_duration = clip.duration
-                clip.close()
-                
-                self.slider_start.configure(to=self.audio_duration)
-                self.slider_end.configure(to=self.audio_duration)
-                self.slider_start.set(0)
-                self.slider_end.set(self.audio_duration)
-                self.update_start_lbl(0)
-                self.update_end_lbl(self.audio_duration)
+                with open(self.presets_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        presets.update(data)
             except Exception as e:
-                messagebox.showerror("Error", f"Could not load audio: {e}")
+                print(f"Fehler beim Laden von presets.json: {e}")
+        else:
+            try:
+                with open(self.presets_file, "w", encoding="utf-8") as f:
+                    json.dump(presets, f, indent=4, ensure_ascii=False)
+            except Exception:
+                pass
+        return presets
 
-    def start_generation(self):
-        if not self.video_paths:
-            messagebox.showwarning("Warning", "Please select at least one video clip.")
+    def _save_presets_to_disk(self):
+        try:
+            with open(self.presets_file, "w", encoding="utf-8") as f:
+                json.dump(self.all_presets, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Fehler beim Speichern von presets.json: {e}")
+
+    # =====================================================================
+    # UI Building
+    # =====================================================================
+    def _build_ui(self):
+        self.main_container = ctk.CTkScrollableFrame(self)
+        self.main_container.pack(fill="both", expand=True, padx=15, pady=12)
+
+        # 1. Header
+        lbl_title = ctk.CTkLabel(
+            self.main_container,
+            text="Auto Beat-Sync Edit Maker",
+            font=("Arial", 26, "bold")
+        )
+        lbl_title.pack(pady=(4, 2))
+        
+        lbl_sub = ctk.CTkLabel(
+            self.main_container,
+            text="Pro Studio Engine | Multi-Band Transient Sync | 60 FPS | OpenCV Hardware-Beschleunigung",
+            text_color="#38bdf8",
+            font=("Arial", 12)
+        )
+        lbl_sub.pack(pady=(0, 10))
+
+        # Profile & Preset Management Frame
+        profile_frame = ctk.CTkFrame(self.main_container)
+        profile_frame.pack(fill="x", pady=5)
+
+        header_prof = ctk.CTkFrame(profile_frame, fg_color="transparent")
+        header_prof.pack(fill="x", padx=12, pady=(8, 2))
+        ctk.CTkLabel(header_prof, text="Profile & Presets (Speichern & Laden)", font=("Arial", 14, "bold")).pack(side="left")
+
+        row_prof = ctk.CTkFrame(profile_frame, fg_color="transparent")
+        row_prof.pack(fill="x", padx=12, pady=(3, 8))
+
+        ctk.CTkLabel(row_prof, text="Profil:").pack(side="left", padx=(0, 6))
+        self.preset_names = list(self.all_presets.keys())
+        self.profile_var = ctk.StringVar(value=self.preset_names[0] if self.preset_names else "Standard")
+        self.combo_profile = ctk.CTkComboBox(
+            row_prof,
+            values=self.preset_names,
+            variable=self.profile_var,
+            command=self.on_profile_selected,
+            width=230
+        )
+        self.combo_profile.pack(side="left", padx=4)
+
+        self.btn_save_profile = ctk.CTkButton(
+            row_prof,
+            text="Profil speichern",
+            command=self.save_current_as_profile,
+            fg_color="#1f8a4c",
+            hover_color="#176b3b",
+            width=120
+        )
+        self.btn_save_profile.pack(side="left", padx=4)
+
+        self.btn_load_json = ctk.CTkButton(
+            row_prof,
+            text="JSON laden",
+            command=self.import_profile_json,
+            fg_color="#2b719e",
+            hover_color="#1f5375",
+            width=90
+        )
+        self.btn_load_json.pack(side="left", padx=4)
+
+        self.btn_export_json = ctk.CTkButton(
+            row_prof,
+            text="Export",
+            command=self.export_profile_json,
+            fg_color="#444444",
+            hover_color="#555555",
+            width=75
+        )
+        self.btn_export_json.pack(side="left", padx=4)
+
+        self.btn_delete_prof = ctk.CTkButton(
+            row_prof,
+            text="Loeschen",
+            command=self.delete_current_profile,
+            fg_color="#8b1e1e",
+            hover_color="#631414",
+            width=75
+        )
+        self.btn_delete_prof.pack(side="left", padx=4)
+
+        # 2. Media Selection Frame
+        media_frame = ctk.CTkFrame(self.main_container)
+        media_frame.pack(fill="x", pady=5)
+
+        header_media = ctk.CTkFrame(media_frame, fg_color="transparent")
+        header_media.pack(fill="x", padx=12, pady=(10, 4))
+
+        ctk.CTkLabel(header_media, text="1. Medien (Videos & Bilder)", font=("Arial", 14, "bold")).pack(side="left")
+        self.lbl_videos_count = ctk.CTkLabel(header_media, text="0 Dateien ausgewählt", text_color="gray")
+        self.lbl_videos_count.pack(side="right")
+
+        btn_row_media = ctk.CTkFrame(media_frame, fg_color="transparent")
+        btn_row_media.pack(fill="x", padx=12, pady=4)
+
+        self.btn_select_videos = ctk.CTkButton(
+            btn_row_media,
+            text="Clips / Bilder wählen",
+            command=self.select_videos,
+            width=180
+        )
+        self.btn_select_videos.pack(side="left", padx=(0, 10))
+
+        self.btn_clear_videos = ctk.CTkButton(
+            btn_row_media,
+            text="Zurücksetzen",
+            command=self.clear_videos,
+            fg_color="#444444",
+            hover_color="#555555",
+            width=100
+        )
+        self.btn_clear_videos.pack(side="left", padx=5)
+
+        self.shuffle_var = ctk.BooleanVar(value=True)
+        self.chk_shuffle = ctk.CTkCheckBox(
+            btn_row_media,
+            text="Zufällige Reihenfolge (Shuffle)",
+            variable=self.shuffle_var
+        )
+        self.chk_shuffle.pack(side="right", padx=5)
+
+        self.media_listbox = ctk.CTkTextbox(media_frame, height=65, font=("Consolas", 11), activate_scrollbars=True)
+        self.media_listbox.pack(fill="x", padx=12, pady=(4, 10))
+        self.media_listbox.insert("1.0", "Noch keine Dateien gewählt. Unterstützt MP4, MOV, MKV, AVI, PNG, JPG, WEBP...")
+        self.media_listbox.configure(state="disabled")
+
+        # 3. Audio Selection & Trim Frame
+        audio_frame = ctk.CTkFrame(self.main_container)
+        audio_frame.pack(fill="x", pady=5)
+
+        header_audio = ctk.CTkFrame(audio_frame, fg_color="transparent")
+        header_audio.pack(fill="x", padx=12, pady=(10, 4))
+
+        ctk.CTkLabel(header_audio, text="2. Musik (Beat & Song)", font=("Arial", 14, "bold")).pack(side="left")
+        self.lbl_audio_status = ctk.CTkLabel(header_audio, text="Kein Song gewählt", text_color="gray")
+        self.lbl_audio_status.pack(side="right")
+
+        btn_row_audio = ctk.CTkFrame(audio_frame, fg_color="transparent")
+        btn_row_audio.pack(fill="x", padx=12, pady=4)
+
+        self.btn_select_audio = ctk.CTkButton(
+            btn_row_audio,
+            text="Song auswählen",
+            command=self.select_audio,
+            width=180
+        )
+        self.btn_select_audio.pack(side="left", padx=(0, 10))
+
+        self.btn_audio_preview = ctk.CTkButton(
+            btn_row_audio,
+            text="Vorhören",
+            command=self.toggle_audio_preview,
+            fg_color="#2b719e",
+            hover_color="#1f5375",
+            width=110,
+            state="disabled"
+        )
+        self.btn_audio_preview.pack(side="left", padx=5)
+
+        slider_frame = ctk.CTkFrame(audio_frame, fg_color="transparent")
+        slider_frame.pack(fill="x", padx=12, pady=(4, 10))
+
+        start_row = ctk.CTkFrame(slider_frame, fg_color="transparent")
+        start_row.pack(fill="x", pady=2)
+        self.lbl_start = ctk.CTkLabel(start_row, text="Start: 0.0s", width=90, anchor="w", font=("Arial", 12))
+        self.lbl_start.pack(side="left")
+        self.slider_start = ctk.CTkSlider(start_row, from_=0, to=100, command=self.update_start_lbl)
+        self.slider_start.set(0)
+        self.slider_start.pack(side="right", fill="x", expand=True, padx=5)
+
+        end_row = ctk.CTkFrame(slider_frame, fg_color="transparent")
+        end_row.pack(fill="x", pady=2)
+        self.lbl_end = ctk.CTkLabel(end_row, text="Ende: 0.0s", width=90, anchor="w", font=("Arial", 12))
+        self.lbl_end.pack(side="left")
+        self.slider_end = ctk.CTkSlider(end_row, from_=0, to=100, command=self.update_end_lbl)
+        self.slider_end.set(0)
+        self.slider_end.pack(side="right", fill="x", expand=True, padx=5)
+
+        # 4. Beat Detection & Pacing Frame (Multi-Band Engine)
+        sync_frame = ctk.CTkFrame(self.main_container)
+        sync_frame.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(sync_frame, text="3. Beat-Sync & Multi-Band Timing", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 3))
+
+        mode_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
+        mode_row.pack(fill="x", padx=12, pady=3)
+
+        self.mode_var = ctk.StringVar(value="auto")
+        ctk.CTkRadioButton(mode_row, text="Auto Takt (Kick & Snare Transient-Sync)", variable=self.mode_var, value="auto").pack(side="left", padx=8)
+        ctk.CTkRadioButton(mode_row, text="Dynamisch (Alle Onsets)", variable=self.mode_var, value="onsets").pack(side="left", padx=8)
+        ctk.CTkRadioButton(mode_row, text="Manuell (Mit Takt-Magnet)", variable=self.mode_var, value="manual").pack(side="left", padx=8)
+
+        pace_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
+        pace_row.pack(fill="x", padx=12, pady=(4, 10))
+
+        ctk.CTkLabel(pace_row, text="Schnitt-Tempo:").pack(side="left", padx=(0, 8))
+        self.pace_var = ctk.StringVar(value="1x (Jeder Takt)")
+        self.combo_pace = ctk.CTkComboBox(
+            pace_row,
+            values=["1x (Jeder Takt)", "2x Schnell (Halber Takt)", "0.5x Entspannt (Doppel-Takt)"],
+            variable=self.pace_var,
+            width=210
+        )
+        self.combo_pace.pack(side="left", padx=5)
+
+        self.ai_audio_analysis_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            pace_row,
+            text="KI-Struktur- & Drum-Isolation (ML-Cluster)",
+            variable=self.ai_audio_analysis_var
+        ).pack(side="left", padx=(15, 5))
+
+        # 5. Format, Skalierung & Qualität
+        format_frame = ctk.CTkFrame(self.main_container)
+        format_frame.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(format_frame, text="4. Format, Auflösung, Qualität & FPS", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 3))
+        
+        row_fmt = ctk.CTkFrame(format_frame, fg_color="transparent")
+        row_fmt.pack(fill="x", padx=12, pady=3)
+
+        ctk.CTkLabel(row_fmt, text="Format:").pack(side="left", padx=(0, 8))
+        self.orient_var = ctk.StringVar(value="original")
+        ctk.CTkRadioButton(row_fmt, text="Originalformat (Kein Zoom)", variable=self.orient_var, value="original").pack(side="left", padx=6)
+        ctk.CTkRadioButton(row_fmt, text="Hochkant (9:16)", variable=self.orient_var, value="portrait").pack(side="left", padx=6)
+        ctk.CTkRadioButton(row_fmt, text="Quer (16:9)", variable=self.orient_var, value="landscape").pack(side="left", padx=6)
+
+        row_scale_fps = ctk.CTkFrame(format_frame, fg_color="transparent")
+        row_scale_fps.pack(fill="x", padx=12, pady=3)
+
+        ctk.CTkLabel(row_scale_fps, text="Einpassung:").pack(side="left", padx=(0, 6))
+        self.scale_mode_var = ctk.StringVar(value="fit")
+        ctk.CTkRadioButton(row_scale_fps, text="Ganzes Bild (Fit)", variable=self.scale_mode_var, value="fit").pack(side="left", padx=5)
+        ctk.CTkRadioButton(row_scale_fps, text="Vollbild (Crop)", variable=self.scale_mode_var, value="fill").pack(side="left", padx=5)
+
+        ctk.CTkLabel(row_scale_fps, text="Framerate:").pack(side="left", padx=(15, 6))
+        self.fps_var = ctk.IntVar(value=60)
+        ctk.CTkRadioButton(row_scale_fps, text="60 FPS (Flüssig)", variable=self.fps_var, value=60).pack(side="left", padx=5)
+        ctk.CTkRadioButton(row_scale_fps, text="30 FPS", variable=self.fps_var, value=30).pack(side="left", padx=5)
+
+        row_quality = ctk.CTkFrame(format_frame, fg_color="transparent")
+        row_quality.pack(fill="x", padx=12, pady=(3, 10))
+
+        ctk.CTkLabel(row_quality, text="Export-Qualität:").pack(side="left", padx=(0, 6))
+        self.quality_var = ctk.StringVar(value="High Quality (CRF 16 Studio)")
+        ctk.CTkComboBox(
+            row_quality,
+            values=[
+                "High Quality (CRF 16 Studio)",
+                "Maximal (CRF 14 Glasklar)",
+                "Ultra-Fast (CRF 20 Schnell)"
+            ],
+            variable=self.quality_var,
+            width=230
+        ).pack(side="left", padx=5)
+
+        ctk.CTkLabel(row_quality, text="Auflösung:").pack(side="left", padx=(15, 6))
+        self.res_var = ctk.StringVar(value="1080p (Full HD)")
+        ctk.CTkComboBox(
+            row_quality,
+            values=[
+                "1080p (Full HD)",
+                "1440p (2K Ultra Sharp)",
+                "Originalgröße der Dateien"
+            ],
+            variable=self.res_var,
+            width=180
+        ).pack(side="left", padx=5)
+
+        # 6. Audio-Mixing & Fade-Out
+        audio_opt_frame = ctk.CTkFrame(self.main_container)
+        audio_opt_frame.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(audio_opt_frame, text="5. Audio-Mixing & Ausblenden", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 3))
+        
+        row_mix = ctk.CTkFrame(audio_opt_frame, fg_color="transparent")
+        row_mix.pack(fill="x", padx=12, pady=(3, 10))
+
+        ctk.CTkLabel(row_mix, text="Original Clip-Sound:").pack(side="left", padx=(0, 8))
+        self.clip_audio_var = ctk.StringVar(value="Stumm (100% Musik)")
+        ctk.CTkComboBox(
+            row_mix,
+            values=["Stumm (100% Musik)", "Dezent 15% (Killsounds/SFX)", "Mittel 35% (Dialoge/SFX)"],
+            variable=self.clip_audio_var,
+            width=210
+        ).pack(side="left", padx=5)
+
+        self.fade_out_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            row_mix,
+            text="Sanfter Audio- & Video-Fade-Out am Ende (0.8s)",
+            variable=self.fade_out_var
+        ).pack(side="left", padx=(15, 5))
+
+        # 7. Modern High-Impact Effects & Cinematic Grading Frame
+        effects_frame = ctk.CTkFrame(self.main_container)
+        effects_frame.pack(fill="x", pady=5)
+
+        eff_header = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        eff_header.pack(fill="x", padx=12, pady=(10, 3))
+        ctk.CTkLabel(eff_header, text="6. Professionelle Impact-Effekte & Cinematic Look", font=("Arial", 14, "bold")).pack(side="left")
+
+        preset_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        preset_row.pack(fill="x", padx=12, pady=3)
+
+        ctk.CTkLabel(preset_row, text="Effekt-Stil:").pack(side="left", padx=(0, 8))
+        self.combo_fx_style = ctk.StringVar(value="Dynamischer Rhythmus-Flow (Abwechslungsreich)")
+        ctk.CTkComboBox(
+            preset_row,
+            values=[
+                "Dynamischer Rhythmus-Flow (Abwechslungsreich)",
+                "Impact-Combo (Volle Power auf jeden Beat)",
+                "Zufällig wechselnd (Ein Effekt pro Cut)",
+                "Dezent & Sanft (Nur weiche Übergänge)"
+            ],
+            variable=self.combo_fx_style,
+            width=390
+        ).pack(side="left", padx=5)
+
+        self.fx_cinematic_lut = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            preset_row,
+            text="Cinematic S-Curve Contrast & Color Pop",
+            variable=self.fx_cinematic_lut
+        ).pack(side="left", padx=(15, 5))
+
+        # Intensity Slider Row
+        intensity_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        intensity_row.pack(fill="x", padx=12, pady=(4, 2))
+
+        self.lbl_fx_intensity = ctk.CTkLabel(intensity_row, text="Effekt-Intensität: 100% (Recoil & Bloom)", width=280, anchor="w")
+        self.lbl_fx_intensity.pack(side="left", padx=(0, 10))
+
+        self.slider_fx_intensity = ctk.CTkSlider(
+            intensity_row,
+            from_=20, to=200,
+            command=lambda v: self.lbl_fx_intensity.configure(text=f"Effekt-Intensität: {int(v)}% (Recoil & Bloom)")
+        )
+        self.slider_fx_intensity.set(100)
+        self.slider_fx_intensity.pack(side="left", fill="x", expand=True, padx=5)
+
+        eff_grid = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        eff_grid.pack(fill="x", padx=12, pady=(6, 10))
+
+        self.fx_shake = ctk.BooleanVar(value=True)
+        self.fx_bloom_flash = ctk.BooleanVar(value=True)
+        self.fx_punch_zoom = ctk.BooleanVar(value=True)
+        self.fx_slow_push = ctk.BooleanVar(value=True)
+        self.fx_rgb_shock = ctk.BooleanVar(value=True)
+        self.fx_vignette = ctk.BooleanVar(value=True)
+        self.fx_speedramp = ctk.BooleanVar(value=True)
+
+        ctk.CTkCheckBox(eff_grid, text="Bass-Shake (Rotations-Tilt & Recoil)", variable=self.fx_shake).grid(row=0, column=0, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Exposure Bloom-Flash (Highlight-Burst)", variable=self.fx_bloom_flash).grid(row=0, column=1, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Punch-Zoom (Optischer Ease)", variable=self.fx_punch_zoom).grid(row=0, column=2, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Radial RGB-Aberration (Linsenzerlegung)", variable=self.fx_rgb_shock).grid(row=1, column=0, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Cinematic Vignette (Dunkler Randfokus)", variable=self.fx_vignette).grid(row=1, column=1, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Slow Push-In (Sanfte Kamerafahrt)", variable=self.fx_slow_push).grid(row=1, column=2, sticky="w", padx=8, pady=3)
+        ctk.CTkCheckBox(eff_grid, text="Speed-Ramp (Sync-Safe Velocity)", variable=self.fx_speedramp).grid(row=2, column=0, sticky="w", padx=8, pady=3)
+
+        # 8. Spinning Overlay Frame
+        overlay_frame = ctk.CTkFrame(self.main_container)
+        overlay_frame.pack(fill="x", pady=5)
+
+        overlay_header = ctk.CTkFrame(overlay_frame, fg_color="transparent")
+        overlay_header.pack(fill="x", padx=12, pady=(10, 4))
+
+        self.enable_overlay_var = ctk.BooleanVar(value=False)
+        self.chk_overlay = ctk.CTkCheckBox(
+            overlay_header,
+            text="Spinning Bild-Overlay aktivieren",
+            variable=self.enable_overlay_var,
+            command=self._toggle_overlay_ui,
+            font=("Arial", 14, "bold")
+        )
+        self.chk_overlay.pack(side="left")
+
+        self.overlay_options_frame = ctk.CTkFrame(overlay_frame, fg_color="transparent")
+
+        # Row 1: Image Selection
+        row_ov1 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
+        row_ov1.pack(fill="x", padx=12, pady=4)
+
+        self.btn_select_overlay = ctk.CTkButton(
+            row_ov1,
+            text="Overlay-Bild wählen (PNG/JPG)",
+            command=self.select_overlay_image,
+            width=220
+        )
+        self.btn_select_overlay.pack(side="left", padx=(0, 10))
+
+        self.lbl_overlay_name = ctk.CTkLabel(row_ov1, text="Kein Bild ausgewählt", text_color="gray")
+        self.lbl_overlay_name.pack(side="left")
+
+        # Row 2: Timing / Start-Point
+        row_ov2 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
+        row_ov2.pack(fill="x", padx=12, pady=4)
+
+        ctk.CTkLabel(row_ov2, text="Start-Zeitpunkt:").pack(side="left", padx=(0, 8))
+        self.overlay_start_mode = ctk.StringVar(value="custom")
+        ctk.CTkRadioButton(row_ov2, text="Ab Beat-Drop / Sekunde", variable=self.overlay_start_mode, value="custom").pack(side="left", padx=6)
+        ctk.CTkRadioButton(row_ov2, text="Von Anfang an (0.0s)", variable=self.overlay_start_mode, value="start").pack(side="left", padx=6)
+
+        self.btn_detect_drop = ctk.CTkButton(
+            row_ov2, text="Auto-Drop finden", width=130, height=26,
+            fg_color="#334155", hover_color="#475569",
+            command=self.auto_detect_drop_ui
+        )
+        self.btn_detect_drop.pack(side="right", padx=(6, 0))
+
+        self.row_ov_slider = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
+        self.row_ov_slider.pack(fill="x", padx=12, pady=2)
+        self.lbl_overlay_sec = ctk.CTkLabel(self.row_ov_slider, text="Start bei: 29.0s", width=120, anchor="w")
+        self.lbl_overlay_sec.pack(side="left")
+        self.slider_overlay_sec = ctk.CTkSlider(
+            self.row_ov_slider, from_=0, to=120,
+            command=lambda v: self.lbl_overlay_sec.configure(text=f"Start bei: {v:.1f}s")
+        )
+        self.slider_overlay_sec.set(29.0)
+        self.slider_overlay_sec.pack(side="right", fill="x", expand=True, padx=5)
+
+        # Row 3: Placement & Size
+        row_ov3 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
+        row_ov3.pack(fill="x", padx=12, pady=4)
+
+        ctk.CTkLabel(row_ov3, text="Platzierung:").pack(side="left", padx=(0, 6))
+        self.overlay_corner_var = ctk.StringVar(value="Wechselt zum Takt (Animiert)")
+        self.combo_corner = ctk.CTkComboBox(
+            row_ov3,
+            values=[
+                "Wechselt zum Takt (Animiert)",
+                "In der Mitte (Zentriert)",
+                "Oben Links",
+                "Oben Rechts",
+                "Unten Links",
+                "Unten Rechts"
+            ],
+            variable=self.overlay_corner_var,
+            width=220
+        )
+        self.combo_corner.pack(side="left", padx=5)
+
+        ctk.CTkLabel(row_ov3, text="Größe:").pack(side="left", padx=(12, 6))
+        self.overlay_size_var = ctk.StringVar(value="Mittel (30% - Standard)")
+        self.combo_ov_size = ctk.CTkComboBox(
+            row_ov3,
+            values=[
+                "Kompakt (20% - Dezent)",
+                "Mittel (30% - Standard)",
+                "Groß (45% - Fett & Dominant)"
+            ],
+            variable=self.overlay_size_var,
+            width=210
+        )
+        self.combo_ov_size.pack(side="left", padx=5)
+
+        self.overlay_circle_cut_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            row_ov3,
+            text="Kreis-Zuschnitt mit Rand",
+            variable=self.overlay_circle_cut_var
+        ).pack(side="left", padx=(12, 5))
+
+        # Row 4: Speed & Opacity Slider
+        row_ov4 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
+        row_ov4.pack(fill="x", padx=12, pady=(4, 12))
+
+        speed_col = ctk.CTkFrame(row_ov4, fg_color="transparent")
+        speed_col.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.lbl_ov_speed = ctk.CTkLabel(speed_col, text="Dreh-Speed: 1.2x (Umdr./s)", anchor="w")
+        self.lbl_ov_speed.pack(fill="x")
+        self.slider_ov_speed = ctk.CTkSlider(
+            speed_col, from_=0.2, to=4.0,
+            command=lambda v: self.lbl_ov_speed.configure(text=f"Dreh-Speed: {v:.1f}x (Umdr./s)")
+        )
+        self.slider_ov_speed.set(1.2)
+        self.slider_ov_speed.pack(fill="x", pady=2)
+
+        opacity_col = ctk.CTkFrame(row_ov4, fg_color="transparent")
+        opacity_col.pack(side="right", fill="x", expand=True, padx=(10, 0))
+        self.lbl_ov_opacity = ctk.CTkLabel(opacity_col, text="Deckkraft: 100%", anchor="w")
+        self.lbl_ov_opacity.pack(fill="x")
+        self.slider_ov_opacity = ctk.CTkSlider(
+            opacity_col, from_=10, to=100,
+            command=lambda v: self.lbl_ov_opacity.configure(text=f"Deckkraft: {int(v)}%")
+        )
+        self.slider_ov_opacity.set(100.0)
+        self.slider_ov_opacity.pack(fill="x", pady=2)
+
+        # 9. Render & Controls Frame
+        bottom_frame = ctk.CTkFrame(self.main_container)
+        bottom_frame.pack(fill="x", pady=8)
+
+        btn_row_action = ctk.CTkFrame(bottom_frame, fg_color="transparent")
+        btn_row_action.pack(fill="x", padx=20, pady=(12, 6))
+
+        self.btn_generate = ctk.CTkButton(
+            btn_row_action,
+            text="Video Rendern (Pro Studio Engine)",
+            command=self.start_generation,
+            fg_color="#1f8a4c",
+            hover_color="#176b3b",
+            height=44,
+            font=("Arial", 16, "bold")
+        )
+        self.btn_generate.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        self.btn_cancel = ctk.CTkButton(
+            btn_row_action,
+            text="Abbrechen",
+            command=self.cancel_generation,
+            fg_color="#8b1e1e",
+            hover_color="#631414",
+            height=44,
+            width=120,
+            font=("Arial", 14, "bold"),
+            state="disabled"
+        )
+        self.btn_cancel.pack(side="right")
+
+        self.progress_bar = ctk.CTkProgressBar(bottom_frame)
+        self.progress_bar.pack(fill="x", padx=20, pady=(4, 6))
+        self.progress_bar.set(0.0)
+
+        status_row = ctk.CTkFrame(bottom_frame, fg_color="transparent")
+        status_row.pack(fill="x", padx=20, pady=(0, 6))
+
+        self.lbl_status = ctk.CTkLabel(status_row, text="Bereit für Schnitt", font=("Arial", 12), text_color="yellow")
+        self.lbl_status.pack(side="left")
+
+        self.lbl_pct = ctk.CTkLabel(status_row, text="0%", font=("Arial", 12, "bold"))
+        self.lbl_pct.pack(side="right")
+
+        self.post_action_frame = ctk.CTkFrame(bottom_frame, fg_color="transparent")
+        self.btn_open_folder = ctk.CTkButton(
+            self.post_action_frame,
+            text="Ordner im Explorer öffnen",
+            command=self.open_output_folder,
+            fg_color="#2b719e",
+            hover_color="#1f5375",
+            width=200
+        )
+        self.btn_open_folder.pack(side="left", padx=5)
+
+        self.btn_play_video = ctk.CTkButton(
+            self.post_action_frame,
+            text="Video abspielen",
+            command=self.play_output_video,
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            width=150
+        )
+        self.btn_play_video.pack(side="left", padx=5)
+
+    def _toggle_overlay_ui(self):
+        if self.enable_overlay_var.get():
+            self.overlay_options_frame.pack(fill="x", padx=5, pady=(0, 8))
+        else:
+            self.overlay_options_frame.pack_forget()
+
+    def select_overlay_image(self):
+        path = filedialog.askopenfilename(
+            title="Wähle Bild für Spinning Overlay",
+            filetypes=[("Bilder", "*.png *.jpg *.jpeg *.webp *.bmp"), ("Alle Dateien", "*.*")]
+        )
+        if path:
+            self.overlay_img_path = path
+            self.enable_overlay_var.set(True)
+            self._toggle_overlay_ui()
+            self.lbl_overlay_name.configure(text=os.path.basename(path), text_color="#38bdf8")
+
+    def auto_detect_drop_ui(self):
+        if not self.audio_path or not os.path.exists(self.audio_path):
+            self.show_error("Hinweis", "Bitte zuerst eine Audio-Datei auswählen.")
             return
-        if not self.audio_path:
-            messagebox.showwarning("Warning", "Please select an audio file.")
-            return
-            
+
         start_t = self.slider_start.get()
         end_t = self.slider_end.get()
-        
-        if start_t >= end_t:
-            messagebox.showwarning("Warning", "End time must be greater than start time.")
-            return
+        dur = max(1.0, end_t - start_t)
 
-        # --- Pre-validate all selected video/image files ---
-        self.lbl_status.configure(text="Validating files...")
-        self.update()
-        valid_paths = []
-        bad_paths = []
-        for vp in self.video_paths:
-            ext = os.path.splitext(vp)[1].lower()
+        def _worker():
             try:
-                if ext in ['.png', '.jpg', '.jpeg', '.webp', '.bmp']:
-                    PIL.Image.open(vp).verify()
-                else:
-                    test = VideoFileClip(vp)
-                    # Try reading first frame to catch "failed to read first frame" errors
-                    _ = test.get_frame(0)
-                    test.close()
-                valid_paths.append(vp)
-            except Exception as e:
-                bad_paths.append(os.path.basename(vp))
+                t0 = time.time()
+                self.set_status("KI analysiert Musikstruktur & Drop-Cluster...", 0.3)
+                y, sr = librosa.load(self.audio_path, offset=start_t, duration=dur, sr=22050)
+                best_time = ai_detect_beat_drop(y, sr, len(y) / sr)
+                elapsed = time.time() - t0
 
-        if bad_paths:
-            messagebox.showwarning(
-                "Skipping bad files",
-                "The following files could not be read and will be skipped:\n\n" +
-                "\n".join(bad_paths)
-            )
-        if not valid_paths:
-            messagebox.showerror("Error", "No valid media files found. Aborting.")
-            self.lbl_status.configure(text="Ready")
+                def _apply():
+                    clamped_t = max(0.0, min(dur, best_time))
+                    self.slider_overlay_sec.set(clamped_t)
+                    self.lbl_overlay_sec.configure(text=f"Start bei: {clamped_t:.1f}s")
+                    self.overlay_start_mode.set("custom")
+                    if best_time <= 0.05:
+                        self.set_status("KI: Kein eindeutiger Drop gefunden - bitte manuell setzen.", 0.0)
+                    else:
+                        self.set_status(
+                            f"KI: Beat-Drop erkannt bei {clamped_t:.1f}s ({elapsed:.1f}s Analyse)", 0.0
+                        )
+
+                self.after(0, _apply)
+            except Exception as e:
+                self.after(0, lambda: self.set_status(f"Fehler bei Drop-Erkennung: {e}", 0.0))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # =====================================================================
+    # Preset & Profile Management
+    # =====================================================================
+    def on_profile_selected(self, choice):
+        if choice in self.all_presets:
+            self.apply_preset_dict(self.all_presets[choice])
+
+    def get_current_settings_dict(self):
+        return {
+            "mode": self.mode_var.get(),
+            "pace": self.pace_var.get(),
+            "orientation": self.orient_var.get(),
+            "scale_mode": self.scale_mode_var.get(),
+            "fps": int(self.fps_var.get()),
+            "quality": self.quality_var.get(),
+            "resolution": self.res_var.get(),
+            "clip_audio": self.clip_audio_var.get(),
+            "fade_out": self.fade_out_var.get(),
+            "combo_style": self.combo_fx_style.get(),
+            "fx_intensity": int(self.slider_fx_intensity.get()),
+            "fx_shake": self.fx_shake.get(),
+            "fx_bloom_flash": self.fx_bloom_flash.get(),
+            "fx_punch_zoom": self.fx_punch_zoom.get(),
+            "fx_slow_push": self.fx_slow_push.get(),
+            "fx_rgb_shock": self.fx_rgb_shock.get(),
+            "fx_vignette": self.fx_vignette.get(),
+            "fx_speedramp": self.fx_speedramp.get(),
+            "fx_cinematic_lut": self.fx_cinematic_lut.get(),
+            "enable_overlay": self.enable_overlay_var.get(),
+            "overlay_corner": self.overlay_corner_var.get(),
+            "overlay_size": self.overlay_size_var.get(),
+            "overlay_speed": float(self.slider_ov_speed.get()),
+            "overlay_opacity": float(self.slider_ov_opacity.get()),
+            "overlay_start_mode": self.overlay_start_mode.get(),
+            "overlay_circle": self.overlay_circle_cut_var.get()
+        }
+
+    def apply_preset_dict(self, data):
+        if not isinstance(data, dict):
             return
-        self.video_paths = valid_paths
+        if "mode" in data: self.mode_var.set(data["mode"])
+        if "pace" in data: self.pace_var.set(data["pace"])
+        if "orientation" in data: self.orient_var.set(data["orientation"])
+        if "scale_mode" in data: self.scale_mode_var.set(data["scale_mode"])
+        if "fps" in data: self.fps_var.set(int(data["fps"]))
+        if "quality" in data: self.quality_var.set(data["quality"])
+        if "resolution" in data: self.res_var.set(data["resolution"])
+        if "clip_audio" in data: self.clip_audio_var.set(data["clip_audio"])
+        if "fade_out" in data: self.fade_out_var.set(bool(data["fade_out"]))
+        if "combo_style" in data: self.combo_fx_style.set(data["combo_style"])
+        if "fx_intensity" in data:
+            val = float(data["fx_intensity"])
+            self.slider_fx_intensity.set(val)
+            self.lbl_fx_intensity.configure(text=f"Effekt-Intensität: {int(val)}% (Recoil & Bloom)")
+        if "fx_shake" in data: self.fx_shake.set(bool(data["fx_shake"]))
+        if "fx_bloom_flash" in data: self.fx_bloom_flash.set(bool(data["fx_bloom_flash"]))
+        if "fx_punch_zoom" in data: self.fx_punch_zoom.set(bool(data["fx_punch_zoom"]))
+        if "fx_slow_push" in data: self.fx_slow_push.set(bool(data["fx_slow_push"]))
+        if "fx_rgb_shock" in data: self.fx_rgb_shock.set(bool(data["fx_rgb_shock"]))
+        if "fx_vignette" in data: self.fx_vignette.set(bool(data["fx_vignette"]))
+        if "fx_speedramp" in data: self.fx_speedramp.set(bool(data["fx_speedramp"]))
+        if "fx_cinematic_lut" in data: self.fx_cinematic_lut.set(bool(data["fx_cinematic_lut"]))
+        if "enable_overlay" in data:
+            self.enable_overlay_var.set(bool(data["enable_overlay"]))
+            self._toggle_overlay_ui()
+        if "overlay_corner" in data: self.overlay_corner_var.set(data["overlay_corner"])
+        if "overlay_size" in data: self.overlay_size_var.set(data["overlay_size"])
+        if "overlay_speed" in data:
+            spd = float(data["overlay_speed"])
+            self.slider_ov_speed.set(spd)
+            self.lbl_ov_speed.configure(text=f"Dreh-Speed: {spd:.1f}x (Umdr./s)")
+        if "overlay_opacity" in data:
+            op = float(data["overlay_opacity"])
+            self.slider_ov_opacity.set(op)
+            self.lbl_ov_opacity.configure(text=f"Deckkraft: {int(op)}%")
+        if "overlay_start_mode" in data: self.overlay_start_mode.set(data["overlay_start_mode"])
+        if "overlay_circle" in data: self.overlay_circle_cut_var.set(bool(data["overlay_circle"]))
+
+    def save_current_as_profile(self):
+        dialog = ctk.CTkInputDialog(title="Profil speichern", text="Name für das neue Profil:")
+        name = dialog.get_input()
+        if name and name.strip():
+            name = name.strip()
+            self.all_presets[name] = self.get_current_settings_dict()
+            self._save_presets_to_disk()
+            values = list(self.all_presets.keys())
+            self.combo_profile.configure(values=values)
+            self.profile_var.set(name)
+            self.set_status(f"Profil '{name}' erfolgreich gespeichert.", 0.0)
+
+    def import_profile_json(self):
+        path = filedialog.askopenfilename(
+            title="Profil aus JSON-Datei laden",
+            filetypes=[("JSON-Dateien", "*.json"), ("Alle Dateien", "*.*")]
+        )
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    if "mode" in data or "fps" in data:
+                        base_name = os.path.splitext(os.path.basename(path))[0]
+                        self.all_presets[base_name] = data
+                        self._save_presets_to_disk()
+                        self.combo_profile.configure(values=list(self.all_presets.keys()))
+                        self.profile_var.set(base_name)
+                        self.apply_preset_dict(data)
+                        self.set_status(f"Profil aus '{os.path.basename(path)}' geladen.", 0.0)
+                    else:
+                        self.all_presets.update(data)
+                        self._save_presets_to_disk()
+                        self.combo_profile.configure(values=list(self.all_presets.keys()))
+                        self.set_status("Preset-Bundle importiert.", 0.0)
+            except Exception as e:
+                self.show_error("Fehler", f"Konnte Profil nicht laden:\n{e}")
+
+    def export_profile_json(self):
+        path = filedialog.asksaveasfilename(
+            title="Aktuelles Profil exportieren",
+            defaultextension=".json",
+            filetypes=[("JSON-Dateien", "*.json")]
+        )
+        if path:
+            try:
+                current_data = self.get_current_settings_dict()
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(current_data, f, indent=4, ensure_ascii=False)
+                self.set_status(f"Profil nach '{os.path.basename(path)}' exportiert.", 0.0)
+            except Exception as e:
+                self.show_error("Fehler", f"Export fehlgeschlagen:\n{e}")
+
+    def delete_current_profile(self):
+        cur = self.profile_var.get()
+        if cur in DEFAULT_PRESETS:
+            messagebox.showinfo("Hinweis", f"Das Standard-Profil '{cur}' kann nicht gelöscht werden.")
+            return
+        if cur in self.all_presets:
+            del self.all_presets[cur]
+            self._save_presets_to_disk()
+            values = list(self.all_presets.keys())
+            self.combo_profile.configure(values=values)
+            new_sel = values[0] if values else "Standard"
+            self.profile_var.set(new_sel)
+            if new_sel in self.all_presets:
+                self.apply_preset_dict(self.all_presets[new_sel])
+            self.set_status(f"Profil '{cur}' gelöscht.", 0.0)
+
+    # =====================================================================
+    # Thread-Safe UI Update Helpers
+    # =====================================================================
+    def set_status(self, text, progress=None):
+        def _update():
+            self.lbl_status.configure(text=text)
+            if progress is not None:
+                p_clamped = max(0.0, min(1.0, progress))
+                self.progress_bar.set(p_clamped)
+                self.lbl_pct.configure(text=f"{int(p_clamped * 100)}%")
+        self.after(0, _update)
+
+    def show_error(self, title, msg):
+        self.after(0, lambda: messagebox.showerror(title, msg))
+
+    def show_info(self, title, msg):
+        self.after(0, lambda: messagebox.showinfo(title, msg))
+
+    # =====================================================================
+    # Media Selection & Preview
+    # =====================================================================
+    def select_videos(self):
+        paths = filedialog.askopenfilenames(
+            title="Wähle Videos oder Bilder aus",
+            filetypes=[
+                ("Medien-Dateien", "*.mp4 *.mov *.avi *.mkv *.png *.jpg *.jpeg *.webp *.bmp"),
+                ("Video-Dateien", "*.mp4 *.mov *.avi *.mkv"),
+                ("Bilder", "*.png *.jpg *.jpeg *.webp *.bmp"),
+                ("Alle Dateien", "*.*")
+            ]
+        )
+        if paths:
+            new_paths = [p for p in paths if p not in self.video_paths]
+            self.video_paths.extend(new_paths)
+            self._update_media_listbox()
+
+    def clear_videos(self):
+        self.video_paths = []
+        self._update_media_listbox()
+
+    def _update_media_listbox(self):
+        self.media_listbox.configure(state="normal")
+        self.media_listbox.delete("1.0", "end")
+        count = len(self.video_paths)
+        if count == 0:
+            self.media_listbox.insert("1.0", "Noch keine Dateien gewählt. Unterstützt MP4, MOV, MKV, AVI, PNG, JPG, WEBP...")
+            self.lbl_videos_count.configure(text="0 Dateien ausgewählt", text_color="gray")
+        else:
+            names = [f"[{i+1}] {os.path.basename(p)}" for i, p in enumerate(self.video_paths)]
+            self.media_listbox.insert("1.0", "\n".join(names))
+            self.lbl_videos_count.configure(text=f"{count} Dateien bereit", text_color="#38bdf8")
+        self.media_listbox.configure(state="disabled")
+
+    def select_audio(self):
+        path = filedialog.askopenfilename(
+            title="Wähle eine Musik-Datei",
+            filetypes=[("Audio-Dateien", "*.mp3 *.wav *.ogg *.aac *.flac *.m4a"), ("Alle Dateien", "*.*")]
+        )
+        if path:
+            self.audio_path = path
+            try:
+                probe = AudioFileClip(path)
+                self.audio_duration = float(probe.duration)
+                probe.close()
+            except Exception:
+                try:
+                    self.audio_duration = float(librosa.get_duration(path=path))
+                except Exception as e:
+                    self.show_error("Fehler", f"Konnte Audio-Dauer nicht ermitteln:\n{e}")
+                    return
+
+            self.slider_start.configure(to=self.audio_duration)
+            self.slider_end.configure(to=self.audio_duration)
+            self.slider_start.set(0)
+            self.slider_end.set(self.audio_duration)
+            self.lbl_start.configure(text="Start: 0.0s")
+            self.lbl_end.configure(text=f"Ende: {self.audio_duration:.1f}s")
+            if hasattr(self, 'slider_overlay_sec'):
+                self.slider_overlay_sec.configure(to=self.audio_duration)
+            self.lbl_audio_status.configure(
+                text=f"{os.path.basename(path)} ({self.audio_duration:.1f}s)",
+                text_color="#38bdf8"
+            )
+            self.btn_audio_preview.configure(state="normal")
+
+    def update_start_lbl(self, val):
+        val = float(val)
+        if val >= self.slider_end.get():
+            val = max(0, self.slider_end.get() - 0.5)
+            self.slider_start.set(val)
+        self.lbl_start.configure(text=f"Start: {val:.1f}s")
+
+    def update_end_lbl(self, val):
+        val = float(val)
+        if val <= self.slider_start.get():
+            val = min(self.audio_duration, self.slider_start.get() + 0.5)
+            self.slider_end.set(val)
+        self.lbl_end.configure(text=f"Ende: {val:.1f}s")
+
+    def toggle_audio_preview(self):
+        if self.is_preview_playing:
+            self.stop_audio_preview()
+        else:
+            self.start_audio_preview()
+
+    def start_audio_preview(self):
+        if not self.audio_path or not os.path.exists(self.audio_path):
+            return
+
+        self.stop_audio_preview()
+
+        start_t = self.slider_start.get()
+        end_t = self.slider_end.get()
+        dur = max(0.5, end_t - start_t)
+
+        try:
+            fd, temp_preview = tempfile.mkstemp(prefix="autoedit_prev_", suffix=".wav")
+            os.close(fd)
+            self.current_preview_file = temp_preview
+        except Exception:
+            temp_preview = os.path.join(tempfile.gettempdir(), f"autoedit_prev_{int(time.time() * 1000)}.wav")
+            self.current_preview_file = temp_preview
+
+        extracted_ok = False
+        try:
+            cmd = [
+                self.ffmpeg_exe, "-y",
+                "-ss", f"{start_t:.3f}",
+                "-i", self.audio_path,
+                "-t", f"{dur:.3f}",
+                "-vn",
+                "-c:a", "pcm_s16le",
+                "-ar", "44100",
+                "-ac", "2",
+                temp_preview
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode == 0 and os.path.exists(temp_preview) and os.path.getsize(temp_preview) > 44:
+                extracted_ok = True
+            else:
+                cmd2 = [
+                    self.ffmpeg_exe, "-y",
+                    "-i", self.audio_path,
+                    "-ss", f"{start_t:.3f}",
+                    "-t", f"{dur:.3f}",
+                    "-vn",
+                    "-c:a", "pcm_s16le",
+                    "-ar", "44100",
+                    "-ac", "2",
+                    temp_preview
+                ]
+                res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if res2.returncode == 0 and os.path.exists(temp_preview) and os.path.getsize(temp_preview) > 44:
+                    extracted_ok = True
+        except Exception:
+            extracted_ok = False
+
+        try:
+            if extracted_ok:
+                pygame.mixer.music.load(temp_preview)
+            else:
+                pygame.mixer.music.load(self.audio_path)
+                try:
+                    pygame.mixer.music.set_pos(start_t)
+                except Exception:
+                    pass
+
+            pygame.mixer.music.play()
+            self.is_preview_playing = True
+            self.btn_audio_preview.configure(text="Pause", fg_color="#c026d3", hover_color="#9333ea")
+
+            def check_finished():
+                if self.is_preview_playing and not pygame.mixer.music.get_busy():
+                    self.stop_audio_preview()
+                elif self.is_preview_playing:
+                    self.after(100, check_finished)
+
+            self.after(100, check_finished)
+        except Exception as e:
+            self.show_error("Preview-Fehler", f"Konnte Audio nicht abspielen:\n{os.path.basename(self.audio_path)}\n\n{e}")
+            self.stop_audio_preview()
+
+    def stop_audio_preview(self):
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+        except Exception:
+            pass
+        if getattr(self, "current_preview_file", None) and os.path.exists(self.current_preview_file):
+            try:
+                os.remove(self.current_preview_file)
+            except Exception:
+                pass
+            self.current_preview_file = None
+        self.is_preview_playing = False
+        self.btn_audio_preview.configure(text="Vorhören", fg_color="#2b719e", hover_color="#1f5375")
+
+    # =====================================================================
+    # Cancellation & Post-Actions
+    # =====================================================================
+    def cancel_generation(self):
+        self.is_cancelled = True
+        self.set_status("Abbruch angefordert... Bereinige Prozesse.", 0.0)
+
+    def open_output_folder(self):
+        if self.last_rendered_path and os.path.exists(self.last_rendered_path):
+            folder = os.path.dirname(self.last_rendered_path)
+            subprocess.Popen(f'explorer /select,"{os.path.normpath(self.last_rendered_path)}"')
+        else:
+            self.show_error("Fehler", "Kein erstelltes Video gefunden.")
+
+    def play_output_video(self):
+        if self.last_rendered_path and os.path.exists(self.last_rendered_path):
+            os.startfile(self.last_rendered_path)
+        else:
+            self.show_error("Fehler", "Video-Datei existiert nicht.")
+
+    # =====================================================================
+    # Generation Workflow
+    # =====================================================================
+    def start_generation(self):
+        if not self.video_paths:
+            self.show_error("Fehler", "Bitte wähle mindestens ein Video oder Bild aus.")
+            return
+        if not self.audio_path:
+            self.show_error("Fehler", "Bitte wähle eine Musik-Datei aus.")
+            return
+
+        start_t = self.slider_start.get()
+        end_t = self.slider_end.get()
+        if end_t <= start_t:
+            self.show_error("Fehler", "Das Ende der Musik muss nach dem Start liegen.")
+            return
+
+        out_path = filedialog.asksaveasfilename(
+            title="Video speichern als",
+            defaultextension=".mp4",
+            filetypes=[("MP4 Video", "*.mp4")]
+        )
+        if not out_path:
+            return
+
+        self.is_cancelled = False
+        self.btn_generate.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+        self.post_action_frame.pack_forget()
+
         if self.shuffle_var.get():
             random.shuffle(self.video_paths)
-        self.lbl_videos.configure(text=f"{len(self.video_paths)} media files selected", text_color="white")
 
-        out_path = filedialog.asksaveasfilename(title="Save Video", defaultextension=".mp4", filetypes=[("MP4 Video", "*.mp4")])
-        if not out_path:
-            self.lbl_status.configure(text="Ready")
-            return
-
-        self.btn_generate.configure(state="disabled")
-        
         mode = self.mode_var.get()
-        if mode in ("auto", "onsets"):
-            self.lbl_status.configure(text="Processing... This will take a while.")
-            self.update()
-            threading.Thread(target=self.generate_edit, args=(start_t, end_t, out_path, None, mode), daemon=True).start()
+        if mode == "manual":
+            self.open_manual_recorder(start_t, end_t, out_path)
         else:
-            self.start_manual_recording(start_t, end_t, out_path)
+            self.set_status("Starte Beat-Analyse & Vorbereitung...", 0.05)
+            threading.Thread(
+                target=self.generate_edit,
+                args=(start_t, end_t, out_path, None, mode),
+                daemon=True
+            ).start()
 
-    def start_manual_recording(self, start_t, end_t, out_path):
-        self.lbl_status.configure(text="Preparing audio for manual mode...")
-        self.update()
-        
-        pygame.mixer.init()
-        temp_wav = "temp_manual.wav"
-        
+    # =====================================================================
+    # Manual Recording Mode (Takt-Magnet)
+    # =====================================================================
+    def open_manual_recorder(self, start_t, end_t, out_path):
+        total_duration = end_t - start_t
+        temp_dir = tempfile.mkdtemp(prefix="autoedit_manual_")
+        master_audio_wav = os.path.join(temp_dir, "master_audio.wav")
+
         try:
-            audio_clip = AudioFileClip(self.audio_path).subclip(start_t, end_t)
-            audio_clip.write_audiofile(temp_wav, logger=None)
-            audio_clip.close()
+            cmd = [
+                self.ffmpeg_exe, "-y",
+                "-ss", f"{start_t:.3f}",
+                "-i", self.audio_path,
+                "-t", f"{total_duration:.3f}",
+                "-vn",
+                "-c:a", "pcm_s16le",
+                "-ar", "44100",
+                "-ac", "2",
+                master_audio_wav
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode != 0:
+                raise RuntimeError("FFmpeg Audio-Extraktion fehlgeschlagen.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to prepare audio: {e}")
+            self.show_error("Fehler", f"Audio-Vorbereitung fehlgeschlagen:\n{e}")
             self.btn_generate.configure(state="normal")
+            self.btn_cancel.configure(state="disabled")
+            shutil.rmtree(temp_dir, ignore_errors=True)
             return
-            
+
+        detected_onsets = []
+        try:
+            y_m, sr_m = librosa.load(master_audio_wav, sr=22050)
+            y_perc = librosa.effects.percussive(y_m, margin=2.0)
+            env_low = librosa.onset.onset_strength(y=y_perc, sr=sr_m, fmax=280)
+            env_high = librosa.onset.onset_strength(y=y_perc, sr=sr_m, fmin=800, fmax=5500)
+            onset_env = env_low * 1.0 + env_high * 0.65
+            onset_frames = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr_m, backtrack=True, wait=6, delta=0.07)
+            detected_onsets = list(librosa.frames_to_time(onset_frames, sr=sr_m))
+            del y_m, y_perc, env_low, env_high, onset_env
+        except Exception:
+            detected_onsets = []
+
         self.manual_times = []
-        
         rec_win = ctk.CTkToplevel(self)
-        rec_win.title("Manual Cut Recording")
-        rec_win.geometry("450x250")
+        rec_win.title("Manuelles Beat-Recording (Mit Takt-Magnet)")
+        rec_win.geometry("520x330")
         rec_win.transient(self)
         rec_win.grab_set()
-        
-        lbl_info = ctk.CTkLabel(rec_win, text="Press SPACE, any arrow key, or LMB/RMB to record a cut.\nClose this window when done to start generating.", font=("Arial", 14))
-        lbl_info.pack(pady=20)
-        
-        lbl_cuts = ctk.CTkLabel(rec_win, text="Cuts recorded: 0", font=("Arial", 18, "bold"), text_color="yellow")
-        lbl_cuts.pack(pady=10)
-        
+
+        lbl_info = ctk.CTkLabel(
+            rec_win,
+            text="Tippe im Takt der Musik: LEERTASTE, Pfeiltasten oder Maus!\nFenster schließen, wenn fertig.",
+            font=("Arial", 14)
+        )
+        lbl_info.pack(pady=12)
+
+        magnet_var = ctk.BooleanVar(value=True)
+        chk_magnet = ctk.CTkCheckBox(
+            rec_win,
+            text="Takt-Magnet aktiv (Klicks an Drum-Hits einrasten)",
+            variable=magnet_var
+        )
+        chk_magnet.pack(pady=(0, 8))
+
+        lbl_cuts = ctk.CTkLabel(rec_win, text="Aufgenommene Beats: 0", font=("Arial", 18, "bold"), text_color="yellow")
+        lbl_cuts.pack(pady=3)
+
+        lbl_time = ctk.CTkLabel(rec_win, text="Zeit: 0.0s / 0.0s", font=("Arial", 12), text_color="gray")
+        lbl_time.pack(pady=2)
+
         try:
-            pygame.mixer.music.load(temp_wav)
+            pygame.mixer.music.load(master_audio_wav)
         except Exception as e:
-            messagebox.showerror("Error", f"Pygame couldn't load audio: {e}")
+            self.show_error("Fehler", f"Pygame Audio-Ladefehler:\n{e}")
             rec_win.destroy()
+            shutil.rmtree(temp_dir, ignore_errors=True)
             self.btn_generate.configure(state="normal")
+            self.btn_cancel.configure(state="disabled")
             return
-            
+
         is_playing = False
-        
+        start_perf_time = 0.0
+
         def record_cut(event=None):
+            nonlocal is_playing, start_perf_time
             if not is_playing:
                 return
-            current_time = pygame.mixer.music.get_pos() / 1000.0
-            if current_time > 0:
-                self.manual_times.append(current_time)
-                lbl_cuts.configure(text=f"Cuts recorded: {len(self.manual_times)}")
+            raw_time = time.perf_counter() - start_perf_time
+            compensated_time = max(0.01, raw_time - 0.07)
+            if 0.05 < compensated_time < total_duration:
+                self.manual_times.append(compensated_time)
+                lbl_cuts.configure(text=f"Aufgenommene Beats: {len(self.manual_times)}")
 
-        # Spacebar + all arrow keys + left/right mouse button
         for key in ("<space>", "<Left>", "<Right>", "<Up>", "<Down>"):
             rec_win.bind(key, record_cut)
-        rec_win.bind("<Button-1>", record_cut)   # LMB
-        rec_win.bind("<Button-3>", record_cut)   # RMB
-        
+        rec_win.bind("<Button-1>", record_cut)
+        rec_win.bind("<Button-3>", record_cut)
+
+        def update_playback_clock():
+            if is_playing:
+                elapsed = time.perf_counter() - start_perf_time
+                lbl_time.configure(text=f"Zeit: {min(elapsed, total_duration):.1f}s / {total_duration:.1f}s")
+                if elapsed >= total_duration:
+                    on_close()
+                    return
+                rec_win.after(40, update_playback_clock)
+
         def start_play():
-            nonlocal is_playing
+            nonlocal is_playing, start_perf_time
             is_playing = True
             btn_start.configure(state="disabled")
+            start_perf_time = time.perf_counter()
             pygame.mixer.music.play()
-            rec_win.focus_set() # Focus back to capture spacebar
-            
-        btn_start = ctk.CTkButton(rec_win, text="Start Playback", command=start_play, font=("Arial", 16, "bold"), height=40)
+            rec_win.focus_set()
+            update_playback_clock()
+
+        btn_start = ctk.CTkButton(rec_win, text="Aufnahme Starten", command=start_play, font=("Arial", 15, "bold"), height=40)
         btn_start.pack(pady=10)
-        
+
         def on_close():
-            pygame.mixer.music.stop()
-            pygame.mixer.quit()
-            rec_win.destroy()
-            
+            nonlocal is_playing
+            is_playing = False
             try:
-                if os.path.exists(temp_wav):
-                    os.remove(temp_wav)
-            except:
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+            except Exception:
                 pass
-                
+            rec_win.destroy()
+
+            final_beats = []
             if len(self.manual_times) > 0:
-                beat_times = sorted(self.manual_times)
-                if beat_times[0] > 0.05: # Prevent extremely small first cuts
-                    beat_times.insert(0, 0.0)
+                raw_sorted = sorted(list(set(self.manual_times)))
+                if magnet_var.get() and len(detected_onsets) > 0:
+                    onsets_arr = np.array(detected_onsets)
+                    for tap in raw_sorted:
+                        diffs = np.abs(onsets_arr - tap)
+                        nearest_idx = int(np.argmin(diffs))
+                        if diffs[nearest_idx] <= 0.22:
+                            final_beats.append(float(onsets_arr[nearest_idx]))
+                        else:
+                            final_beats.append(float(tap))
                 else:
-                    beat_times[0] = 0.0
-                    
-                if beat_times[-1] < (end_t - start_t):
-                    beat_times.append(end_t - start_t)
-                    
-                self.lbl_status.configure(text="Generating edit from manual cuts...")
-                threading.Thread(target=self.generate_edit, args=(start_t, end_t, out_path, beat_times), daemon=True).start()
+                    final_beats = raw_sorted
+
+                final_beats = sorted(list(set(final_beats)))
+                if final_beats[0] > 0.1:
+                    final_beats.insert(0, 0.0)
+                else:
+                    final_beats[0] = 0.0
+
+                if final_beats[-1] < total_duration:
+                    final_beats.append(total_duration)
+
+                self.set_status("Generiere Video aus manuellen Schnitten...", 0.1)
+                threading.Thread(
+                    target=self.generate_edit,
+                    args=(start_t, end_t, out_path, final_beats, "manual", master_audio_wav),
+                    daemon=True
+                ).start()
             else:
-                self.lbl_status.configure(text="Recording cancelled (no cuts).")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                self.set_status("Aufnahme abgebrochen (keine Schnitte erfasst).", 0.0)
                 self.btn_generate.configure(state="normal")
-                
+                self.btn_cancel.configure(state="disabled")
+
         rec_win.protocol("WM_DELETE_WINDOW", on_close)
 
-    def generate_edit(self, start_t, end_t, out_path, custom_beat_times=None, mode="auto"):
+    # =====================================================================
+    # Main Generation Pipeline (Pro Studio Engine)
+    # =====================================================================
+    def generate_edit(self, start_t, end_t, out_path, custom_beat_times=None, mode="auto", pre_master_audio=None):
+        temp_dir = tempfile.mkdtemp(prefix="autoedit_render_")
+        temp_files = []
         try:
-            orientation = self.orient_var.get()  # "original", "portrait", "landscape"
+            total_duration = end_t - start_t
+            orientation = self.orient_var.get()
+            scale_mode = self.scale_mode_var.get()
+            pace_choice = self.pace_var.get()
+            fps = int(self.fps_var.get())
+            clip_audio_setting = self.clip_audio_var.get()
+            enable_fade_out = self.fade_out_var.get()
+            apply_cinematic_lut = self.fx_cinematic_lut.get()
 
+            # Quality preset settings
+            quality_str = self.quality_var.get()
+            if "Maximal" in quality_str:
+                crf_val = "14"
+                preset_val = "veryfast"
+            elif "Ultra-Fast" in quality_str:
+                crf_val = "20"
+                preset_val = "ultrafast"
+            else:
+                crf_val = "16"
+                preset_val = "veryfast"
+
+            res_choice = self.res_var.get()
+
+            # Effect controls & intensity
+            fx_style = self.combo_fx_style.get()
+            intensity = float(self.slider_fx_intensity.get()) / 100.0
+            allow_shake = self.fx_shake.get()
+            allow_bloom = self.fx_bloom_flash.get()
+            allow_punch = self.fx_punch_zoom.get()
+            allow_push = self.fx_slow_push.get()
+            allow_rgb = self.fx_rgb_shock.get()
+            allow_vignette = self.fx_vignette.get()
+            allow_speedramp = self.fx_speedramp.get()
+
+            # Spinning Overlay Variables
+            has_overlay = self.enable_overlay_var.get() and self.overlay_img_path and os.path.exists(self.overlay_img_path)
+            overlay_start_type = self.overlay_start_mode.get()
+            overlay_corner_mode = self.overlay_corner_var.get()
+            overlay_size_str = self.overlay_size_var.get()
+            overlay_speed_val = float(self.slider_ov_speed.get())
+            overlay_opacity_val = float(self.slider_ov_opacity.get()) / 100.0
+            overlay_circular = self.overlay_circle_cut_var.get()
+
+            # Master audio extraction
+            master_audio_path = os.path.join(temp_dir, "master_audio.wav")
+            if pre_master_audio and os.path.exists(pre_master_audio):
+                shutil.copy(pre_master_audio, master_audio_path)
+            else:
+                cmd_audio = [
+                    self.ffmpeg_exe, "-y",
+                    "-ss", f"{start_t:.3f}",
+                    "-i", self.audio_path,
+                    "-t", f"{total_duration:.3f}",
+                    "-vn",
+                    "-c:a", "pcm_s16le",
+                    "-ar", "44100",
+                    "-ac", "2",
+                    master_audio_path
+                ]
+                subprocess.run(cmd_audio, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            if self.is_cancelled:
+                raise InterruptedError("Vorgang abgebrochen.")
+
+            # -------------------------------------------------------------
+            # STEP 1: Multi-Band Transient Audio-Analyse & Drop-Erkennung
+            # -------------------------------------------------------------
+            drop_timestamp = 0.0
             if custom_beat_times is None:
-                total_duration = end_t - start_t
-                # Use librosa to load audio
-                y, sr = librosa.load(self.audio_path, sr=None, offset=start_t, duration=total_duration)
-                
-                # Isolate percussive parts to ignore vocals/melodies
-                y_percussive = librosa.effects.percussive(y, margin=3.0)
+                self.set_status("Schritt 1/3: Multi-Band Audio-Analyse & Transient-Tracking...", 0.08)
+                sr_target = 22050
+                y, sr = librosa.load(master_audio_path, sr=sr_target)
+                y_percussive = librosa.effects.percussive(y, margin=2.2)
+
+                env_low = librosa.onset.onset_strength(y=y_percussive, sr=sr, fmax=280)
+                env_high = librosa.onset.onset_strength(y=y_percussive, sr=sr, fmin=800, fmax=5500)
+                onset_env = env_low * 1.0 + env_high * 0.65
 
                 if mode == "onsets":
-                    self.lbl_status.configure(text="Step 1/3: Detecting freeform beats & hits (kein fester Takt)...")
-                    # Full percussive onset strength (low + mid hits)
-                    onset_env = librosa.onset.onset_strength(y=y_percussive, sr=sr)
-                    
-                    # Detect all genuine onset peaks directly (natural hits/beats, independent of regular tempo)
-                    # wait=7 corresponds to ~0.16s minimum spacing between cuts (prevents ultra-flickering)
+                    self.set_status("Schritt 1/3: Erfasse dynamische Onset-Peaks...", 0.12)
                     hop_len = 512
                     onset_frames = librosa.onset.onset_detect(
                         onset_envelope=onset_env, sr=sr, hop_length=hop_len,
-                        backtrack=True, wait=7, pre_max=5, post_max=5, pre_avg=7, post_avg=7, delta=0.07
+                        backtrack=True, wait=6, delta=0.07
                     )
-                    beat_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_len)
-
-                    # Free arrays early
-                    del y, y_percussive, onset_env, onset_frames
-
-                    # Ensure cuts cover from 0.0 to total duration
-                    beat_times = np.insert(beat_times, 0, 0.0)
-                    if len(beat_times) == 1 or beat_times[-1] < total_duration:
-                        beat_times = np.append(beat_times, total_duration)
-
-                    durations = np.diff(beat_times)
+                    raw_beats = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_len)
+                    beat_times = list(raw_beats)
                 else:
-                    self.lbl_status.configure(text="Step 1/3: Analyzing audio beats and song intro (Takt-Modus)...")
-                    # Calculate onset strength focusing heavily on low frequencies (<250Hz for kicks)
-                    onset_env = librosa.onset.onset_strength(y=y_percussive, sr=sr, fmax=250)
-                    
-                    # Track beats based on the kick onsets (regular meter/tempo)
+                    self.set_status("Schritt 1/3: Berechne Multi-Band Takt & Backtrack-Attack...", 0.12)
                     tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
-                    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-                    
-                    # Calculate RMS energy to detect the intro/outro (low energy parts)
+                    beat_frames = librosa.onset.onset_backtrack(beat_frames, energy=onset_env)
+                    raw_beats = librosa.frames_to_time(beat_frames, sr=sr)
+
                     rms = librosa.feature.rms(y=y)[0]
-                    mean_rms = np.mean(rms)
-                    
-                    # Free audio arrays early
-                    del y, y_percussive, onset_env, beat_frames
+                    mean_rms = float(np.mean(rms)) if len(rms) > 0 else 0.01
 
-                    # Ensure we cover the full duration with cuts
-                    beat_times = np.insert(beat_times, 0, 0.0)
-                    if len(beat_times) == 1 or beat_times[-1] < total_duration:
-                        beat_times = np.append(beat_times, total_duration)
-                        
-                    # Merge beats during low energy (Intro/Outro recognition for longer clips)
-                    merged_beats = [beat_times[0]]
-                    current_beat_idx = 0
-                    while current_beat_idx < len(beat_times) - 1:
-                        next_beat_idx = current_beat_idx + 1
-                        
-                        # Check energy in this interval
-                        start_f = librosa.time_to_frames(beat_times[current_beat_idx], sr=sr)
-                        end_f = librosa.time_to_frames(beat_times[next_beat_idx], sr=sr)
-                        
-                        if end_f > start_f:
-                            segment_rms = np.mean(rms[start_f:end_f])
+                    # KI-basierte Beat-Drop & Struktur-Erkennung
+                    try:
+                        if self.ai_audio_analysis_var.get():
+                            drop_raw_time = ai_detect_beat_drop(y, sr, total_duration)
                         else:
-                            segment_rms = mean_rms
-                            
-                        # If energy is low (< 70% of mean), merge up to 4 beats to make longer clips
-                        if segment_rms < mean_rms * 0.7:
-                            next_beat_idx = min(len(beat_times) - 1, current_beat_idx + 4)
-                            
-                        merged_beats.append(beat_times[next_beat_idx])
-                        current_beat_idx = next_beat_idx
+                            drop_raw_time = 0.0
 
-                    del rms, beat_times
-                    durations = np.diff(merged_beats)
+                        if drop_raw_time > 0.05 and len(raw_beats) > 0:
+                            nearest_idx = int(np.argmin(np.abs(np.array(raw_beats) - drop_raw_time)))
+                            drop_timestamp = float(raw_beats[nearest_idx])
+                        else:
+                            drop_timestamp = max(0.0, drop_raw_time)
+                    except Exception:
+                        drop_timestamp = 0.0
+
+                    beat_times = [float(b) for b in raw_beats]
+                    if len(beat_times) > 1:
+                        merged = []
+                        idx = 0
+                        while idx < len(beat_times) - 1:
+                            t_cur = beat_times[idx]
+                            t_next = beat_times[idx + 1]
+                            f_start = librosa.time_to_frames(t_cur, sr=sr)
+                            f_end = librosa.time_to_frames(t_next, sr=sr)
+                            seg_rms = float(np.mean(rms[f_start:f_end])) if f_end > f_start else mean_rms
+                            merged.append(t_cur)
+                            if seg_rms < mean_rms * 0.60:
+                                idx = min(len(beat_times) - 1, idx + 2)
+                            else:
+                                idx += 1
+                        merged.append(beat_times[-1])
+                        beat_times = merged
+
+                del y, y_percussive, env_low, env_high, onset_env
+
+                beat_times = sorted([b for b in beat_times if 0.0 < b < total_duration])
+                beat_times.insert(0, 0.0)
+                beat_times.append(total_duration)
+
+                dense_beats = [beat_times[0]]
+                for k in range(len(beat_times) - 1):
+                    t1, t2 = beat_times[k], beat_times[k + 1]
+                    diff = t2 - t1
+                    if diff > 2.5:
+                        sub_cuts = int(np.ceil(diff / 1.5))
+                        for s in range(1, sub_cuts):
+                            dense_beats.append(t1 + (diff * s / sub_cuts))
+                    dense_beats.append(t2)
+                beat_times = dense_beats
+
+                if "2x Schnell" in pace_choice:
+                    fast_beats = []
+                    for k in range(len(beat_times) - 1):
+                        fast_beats.append(beat_times[k])
+                        mid = (beat_times[k] + beat_times[k + 1]) / 2.0
+                        if (mid - beat_times[k]) >= 0.15:
+                            fast_beats.append(mid)
+                    fast_beats.append(beat_times[-1])
+                    beat_times = fast_beats
+                elif "0.5x Entspannt" in pace_choice:
+                    calm_beats = [beat_times[0]]
+                    for k in range(1, len(beat_times) - 1, 2):
+                        calm_beats.append(beat_times[k])
+                    calm_beats.append(beat_times[-1])
+                    beat_times = calm_beats
+
+                sanitized_beats = [beat_times[0]]
+                for b in beat_times[1:]:
+                    if b - sanitized_beats[-1] >= 0.15:
+                        sanitized_beats.append(b)
+                if sanitized_beats[-1] != total_duration:
+                    sanitized_beats[-1] = total_duration
+                beat_times = sanitized_beats
             else:
-                self.lbl_status.configure(text="Step 1/3: Using manual cuts...")
-                durations = np.diff(custom_beat_times)
+                self.set_status("Schritt 1/3: Verwende manuelle Schnitte...", 0.15)
+                beat_times = custom_beat_times
+                drop_timestamp = 0.0
 
-            self.lbl_status.configure(text="Step 2/3: Preparing video clips & effects...")
+            if self.is_cancelled:
+                raise InterruptedError("Vorgang abgebrochen.")
 
-            # --- Determine output canvas size from FIRST clip only ---
+            # Frame Quantization (Zero Accumulated Drift)
+            raw_frame_indices = [int(round(t * fps)) for t in beat_times]
+            clean_frame_indices = [raw_frame_indices[0]]
+            min_cut_frames = 5 if fps == 60 else 3
+            for fi in raw_frame_indices[1:]:
+                if fi - clean_frame_indices[-1] >= min_cut_frames:
+                    clean_frame_indices.append(fi)
+            total_target_frames = int(round(total_duration * fps))
+            clean_frame_indices[-1] = total_target_frames
+
+            frame_counts = [clean_frame_indices[k + 1] - clean_frame_indices[k] for k in range(len(clean_frame_indices) - 1)]
+            durations = [fc / float(fps) for fc in frame_counts]
+
+            if has_overlay:
+                if overlay_start_type == "start":
+                    active_overlay_start = 0.0
+                elif overlay_start_type == "drop":
+                    active_overlay_start = drop_timestamp if drop_timestamp > 0 else max(0.0, float(self.slider_overlay_sec.get()))
+                else:
+                    active_overlay_start = max(0.0, min(total_duration, float(self.slider_overlay_sec.get())))
+            else:
+                active_overlay_start = 999999.0
+
+            if has_overlay:
+                print(f"[Overlay] Aktiv ab {active_overlay_start:.2f}s (Trigger: {overlay_start_type}, Drop: {drop_timestamp:.2f}s)")
+
+            # -------------------------------------------------------------
+            # STEP 2: Video-Zuschnitt & Hardware-Beschleunigte Effekte
+            # -------------------------------------------------------------
+            self.set_status("Schritt 2/3: Berechne Canvas & Bild-Einpassung...", 0.20)
+
             orig_w, orig_h = 1920, 1080
             for fp in self.video_paths:
                 f_ext = os.path.splitext(fp)[1].lower()
@@ -423,384 +1819,443 @@ class EditMakerApp(ctk.CTk):
                 except Exception:
                     continue
 
+            # Resolution scaling
+            if "1440p" in res_choice:
+                base_w, base_h = 2560, 1440
+            elif "Original" in res_choice:
+                base_w, base_h = orig_w, orig_h
+            else:
+                base_w, base_h = 1920, 1080
+
             if orientation == "portrait":
-                tw, th = 1080, 1920
+                tw, th = min(base_w, base_h), max(base_w, base_h)
             elif orientation == "landscape":
-                tw, th = 1920, 1080
+                tw, th = max(base_w, base_h), min(base_w, base_h)
             else:
                 tw, th = orig_w, orig_h
 
-            target_size = (tw, th)
+            tw = tw - (tw % 2)
+            th = th - (th % 2)
 
-            # Per-path state: video resume positions & portrait crop cycling
-            video_positions = {}  # path -> next start time (s)
-            image_crop_idx  = {}  # path -> next crop-zone index (cycles top/center/bottom)
+            video_positions = {}
 
-            # Portrait crop zones as relative y positions (top / center / bottom thirds)
-            PORTRAIT_CROP_ZONES = [0.2, 0.5, 0.8]
+            # Precompute Vignette Mask
+            vignette_mask = _build_vignette_mask(tw, th) if allow_vignette else None
 
-            # --- Helper: crop/resize a clip to fill target canvas ---
-            def fit_clip(clip, target_w, target_h, path=None):
+            # Pre-build Spinning Token
+            prepared_token = None
+            if "Groß" in overlay_size_str or "Gross" in overlay_size_str:
+                token_ratio = 0.45
+            elif "Mittel" in overlay_size_str:
+                token_ratio = 0.30
+            else:
+                token_ratio = 0.20
+
+            token_size = int(round(min(tw, th) * token_ratio))
+            margin_x = int(round(tw * 0.035))
+            margin_y = int(round(th * 0.035))
+
+            center_pos = ((tw - token_size) // 2, (th - token_size) // 2)
+            corners = [
+                (margin_x, margin_y),                             # Top-Left
+                (tw - token_size - margin_x, margin_y),           # Top-Right
+                (tw - token_size - margin_x, th - token_size - margin_y), # Bottom-Right
+                (margin_x, th - token_size - margin_y)            # Bottom-Left
+            ]
+
+            if has_overlay:
+                try:
+                    raw_ov = PIL.Image.open(self.overlay_img_path).convert("RGBA")
+                    if overlay_circular:
+                        min_dim = min(raw_ov.width, raw_ov.height)
+                        left = (raw_ov.width - min_dim) // 2
+                        top = (raw_ov.height - min_dim) // 2
+                        sq = raw_ov.crop((left, top, left + min_dim, top + min_dim)).resize((token_size, token_size), PIL.Image.LANCZOS)
+                        mask = PIL.Image.new("L", (token_size, token_size), 0)
+                        d = PIL.ImageDraw.Draw(mask)
+                        d.ellipse((3, 3, token_size - 3, token_size - 3), fill=255)
+                        prepared_token = PIL.Image.new("RGBA", (token_size, token_size), (0, 0, 0, 0))
+                        prepared_token.paste(sq, (0, 0), mask)
+                        d_out = PIL.ImageDraw.Draw(prepared_token)
+                        d_out.ellipse((3, 3, token_size - 3, token_size - 3), outline=(255, 255, 255, 220), width=3)
+                    else:
+                        prepared_token = raw_ov.resize((token_size, token_size), PIL.Image.LANCZOS)
+                    raw_ov.close()
+
+                    if overlay_opacity_val < 0.999 and prepared_token is not None:
+                        r_ch, g_ch, b_ch, a_ch = prepared_token.split()
+                        a_ch = a_ch.point(lambda p: int(p * overlay_opacity_val))
+                        prepared_token = PIL.Image.merge("RGBA", (r_ch, g_ch, b_ch, a_ch))
+                except Exception as e:
+                    print(f"Overlay preparation error: {e}")
+                    prepared_token = None
+
+            def fit_clip(clip, target_w, target_h):
                 cw, ch = clip.size
-                target_ratio = target_w / target_h
-                clip_ratio   = cw / ch
-                if clip_ratio > target_ratio:
-                    resized = clip.resize(height=target_h)
+                if scale_mode == "fit":
+                    scale = min(target_w / float(cw), target_h / float(ch))
+                    resized = clip.resize(scale)
+                    return resized.on_color(size=(target_w, target_h), color=(0, 0, 0), pos="center")
                 else:
-                    resized = clip.resize(width=target_w)
+                    scale = max(target_w / float(cw), target_h / float(ch)) * 1.002
+                    resized = clip.resize(scale)
+                    rw, rh = resized.size
+                    return resized.crop(
+                        x_center=rw / 2.0,
+                        y_center=rh / 2.0,
+                        width=target_w,
+                        height=target_h,
+                    )
 
-                x_center = resized.w / 2
-                y_center = resized.h / 2
-
-                # Portrait clip in landscape canvas → cycle crop zones vertically
-                if path is not None and clip_ratio < 1.0 and target_ratio > 1.0:
-                    idx      = image_crop_idx.get(path, 0)
-                    y_center = resized.h * PORTRAIT_CROP_ZONES[idx % len(PORTRAIT_CROP_ZONES)]
-                    image_crop_idx[path] = idx + 1
-
-                return resized.crop(
-                    x_center=x_center,
-                    y_center=y_center,
-                    width=target_w,
-                    height=target_h,
-                )
-
-            # --- Helper: RGB glitch effect ---
-            def apply_glitch(image):
-                glitched = np.copy(image)
-                if random.random() < 0.2:
-                    shift = random.randint(-15, 15)
-                    glitched[:, :, 0] = np.roll(glitched[:, :, 0], shift, axis=1)
-                return glitched
-
-            # -------------------------------------------------------
-            # Build clip list by opening each source ONE AT A TIME,
-            # processing the segment, writing to a temp file, then
-            # closing it immediately to free RAM.
-            # -------------------------------------------------------
-            temp_files = []
-            clip_idx = 0
-            video_paths = self.video_paths  # local reference
-
-            # Helper: open a source clip from path (pre-rescaling large images saves huge memory and CPU)
             def open_source(path):
                 ext_ = os.path.splitext(path)[1].lower()
                 if ext_ in ['.png', '.jpg', '.jpeg', '.webp', '.bmp']:
+                    if path in self.source_image_cache:
+                        return ImageClip(self.source_image_cache[path])
                     img_ = PIL.Image.open(path).convert("RGB")
-                    # If image is massively larger than target canvas, pre-scale with thumbnail
                     if img_.width > tw * 1.5 or img_.height > th * 1.5:
                         scale = max(tw / img_.width, th / img_.height)
                         nw, nh = max(1, int(img_.width * scale)), max(1, int(img_.height * scale))
                         img_ = img_.resize((nw, nh), resample=PIL.Image.BILINEAR)
-                    c_ = ImageClip(np.array(img_))
+                    arr_ = np.array(img_)
+                    self.source_image_cache[path] = arr_
                     img_.close()
+                    return ImageClip(arr_)
                 else:
-                    c_ = VideoFileClip(path)
-                return c_
+                    return VideoFileClip(path)
 
-            # Helper: cut a source clip to a given duration, resuming for videos
             def cut_source(src, dur, path=None):
                 if isinstance(src, ImageClip):
                     return src.set_duration(dur)
-                # Determine start position
+                safe_max_dur = max(0.1, src.duration - 0.05)
                 if path is not None and path in video_positions:
                     cs = video_positions[path]
-                    if cs >= src.duration - 0.05:
-                        cs = 0.0  # wrap around to start
+                    if cs >= safe_max_dur:
+                        cs = 0.0
                 else:
-                    # First use: pick random start so different runs vary
-                    max_s = max(0, src.duration - dur)
+                    max_s = max(0, safe_max_dur - dur)
                     cs = random.uniform(0, max_s) if max_s > 0 else 0.0
-                end_s = min(cs + dur, src.duration)
+                end_s = min(cs + dur, safe_max_dur)
                 sc = src.subclip(cs, end_s)
-                # Store position for next use of this path
                 if path is not None:
-                    next_pos = end_s if end_s < src.duration - 0.05 else 0.0
+                    next_pos = end_s if end_s < safe_max_dur else 0.0
                     video_positions[path] = next_pos
                 if sc.duration < dur:
                     sc = sc.fx(vfx.loop, duration=dur)
                 return sc
 
+            # =========================================================
+            # Modern High-Impact Edit Effect Engine (Rhythm-Aware)
+            # =========================================================
+            def apply_pro_effects(clip, dur, cut_idx=0):
+                fd = min(0.14, dur)
+                sd = min(0.18, dur)
+                rd = min(0.08, dur)
 
-            i = 0
-            while i < len(durations):
-                duration = float(durations[i])
-                if duration < 0.1:
-                    duration = 0.1
-
-                source_clip = open_source(video_paths[clip_idx])
-
-                # Cut + fit the primary segment
-                cur_path = video_paths[clip_idx]
-                sub_clip = fit_clip(cut_source(source_clip, duration, cur_path), tw, th, cur_path)
-
-                # --- Effect selection ---
-                available_after = len(durations) - i - 1
-                do_collage_16 = (available_after >= 4) and (random.random() < 0.025)
-                do_collage    = (not do_collage_16) and (available_after >= 1) and (random.random() < 0.05)
-                do_spin       = (not do_collage_16) and (not do_collage) and (random.random() < 0.05)
-
-                if do_collage_16:
-                    # ── 16-GRID COLLAGE EFFECT (4x4 Grid) ───────────────────────
-                    # Background = current clip (fullscreen)
-                    # Over 4 beats, 4 tiles appear per beat to fill a 4x4 grid (16 tiles total).
-                    num_steps = 4
-                    step_durs = [max(float(durations[i + j]), 0.1) for j in range(1, num_steps + 1)]
-                    total_dur = duration + sum(step_durs)
-
-                    bg = fit_clip(source_clip, tw, th, cur_path).set_duration(total_dur)
-                    gw, gh = tw // 4, th // 4
-                    layers = [bg]
-                    extra_sources = []
-
-                    # Precompute 4x4 grid positions [(x, y), ...]
-                    grid_positions = [
-                        (col * gw, row * gh)
-                        for row in range(4)
-                        for col in range(4)
-                    ]
-
-                    t_offset = duration
-                    tile_idx = 0
-                    for step in range(num_steps):
-                        # Remaining duration from this step until the end of the collage
-                        step_rem_dur = sum(step_durs[step:])
-                        for _ in range(4):
-                            t_vp = video_paths[(clip_idx + 1 + tile_idx) % len(video_paths)]
-                            t_src = open_source(t_vp)
-                            extra_sources.append(t_src)
-
-                            tile_clip = fit_clip(cut_source(t_src, step_rem_dur, t_vp), gw, gh, t_vp)
-                            tile_clip = tile_clip.without_audio().set_start(t_offset).set_position(grid_positions[tile_idx])
-                            layers.append(tile_clip)
-                            tile_idx += 1
-
-                        t_offset += step_durs[step]
-
-                    sub_clip = CompositeVideoClip(layers, size=(tw, th)).without_audio()
-
-                    temp_path = f"_temp_seg_{len(temp_files):04d}.mp4"
-                    sub_clip.write_videofile(temp_path, fps=30, codec="libx264", threads=4, logger=None,
-                                             ffmpeg_params=["-preset", "ultrafast", "-crf", "18", "-tune", "fastdecode"])
-                    temp_files.append(temp_path)
-
-                    source_clip.close()
-                    for es in extra_sources:
-                        es.close()
-                    try:
-                        sub_clip.close()
-                    except Exception:
-                        pass
-
-                    self.lbl_status.configure(
-                        text=f"Step 2/3: Processing clip {len(temp_files)}/{len(durations)} (16-collage)..."
-                    )
-
-                    clip_idx = (clip_idx + 1 + 16) % len(video_paths)
-                    i += 1 + num_steps
-
-                elif do_collage:
-                    # ── COLLAGE EFFECT ──────────────────────────────────────────
-                    # Background = current clip (fullscreen, full collage duration)
-                    # Then up to 4 quadrant clips pop in one-by-one at each beat.
-                    num_quads = min(4, available_after)
-                    quad_durs = [max(float(durations[i + j]), 0.1) for j in range(1, num_quads + 1)]
-                    total_dur = duration + sum(quad_durs)
-
-                    bg = fit_clip(source_clip, tw, th, cur_path).set_duration(total_dur)
-                    qw, qh = tw // 2, th // 2
-                    quad_positions = [(0, 0), (tw // 2, 0), (0, th // 2), (tw // 2, th // 2)]
-                    layers = [bg]
-                    extra_sources = []
-
-                    t_offset = duration
-                    for q in range(num_quads):
-                        q_vp = video_paths[(clip_idx + 1 + q) % len(video_paths)]
-                        q_src = open_source(q_vp)
-                        extra_sources.append(q_src)
-
-                        # This quadrant stays visible for the remaining duration
-                        q_dur = sum(quad_durs[q:])
-                        q_clip = fit_clip(cut_source(q_src, q_dur, q_vp), qw, qh, q_vp)
-                        q_clip = q_clip.without_audio().set_start(t_offset).set_position(quad_positions[q])
-                        layers.append(q_clip)
-                        t_offset += quad_durs[q]
-
-                    sub_clip = CompositeVideoClip(layers, size=(tw, th)).without_audio()
-
-                    temp_path = f"_temp_seg_{len(temp_files):04d}.mp4"
-                    sub_clip.write_videofile(temp_path, fps=30, codec="libx264", threads=4, logger=None,
-                                             ffmpeg_params=["-preset", "ultrafast", "-crf", "18", "-tune", "fastdecode"])
-                    temp_files.append(temp_path)
-
-                    source_clip.close()
-                    for es in extra_sources:
-                        es.close()
-                    try:
-                        sub_clip.close()
-                    except Exception:
-                        pass
-
-                    self.lbl_status.configure(
-                        text=f"Step 2/3: Processing clip {len(temp_files)}/{len(durations)} (collage)..."
-                    )
-
-                    # Advance past background + all quadrant beats we consumed
-                    clip_idx = (clip_idx + 1 + num_quads) % len(video_paths)
-                    i += 1 + num_quads
-
-                elif do_spin:
-                    # ── SPIN EFFECT ─────────────────────────────────────────────
-                    # Clip rotates a full 360° over its duration.
-                    # We expand the canvas temporarily so corners don't clip, then
-                    # crop back to the target size at the end.
-                    def make_spin_frame(get_frame, t, dur, diag):
-                        angle = (t / dur) * 360.0
-                        img = PIL.Image.fromarray(get_frame(t))
-                        rotated = img.rotate(-angle, resample=PIL.Image.BILINEAR, expand=False)
-                        return np.array(rotated)
-
-                    spin_dur = duration
-                    spin_clip = sub_clip.fl(lambda gf, t: make_spin_frame(gf, t, spin_dur, 0))
-                    # Scale up slightly so the black corners from rotation are hidden
-                    spin_clip = spin_clip.resize(1.42)
-                    spin_clip = spin_clip.crop(
-                        x_center=spin_clip.w / 2, y_center=spin_clip.h / 2,
-                        width=tw, height=th,
-                    ).without_audio()
-
-                    temp_path = f"_temp_seg_{len(temp_files):04d}.mp4"
-                    spin_clip.write_videofile(temp_path, fps=30, codec="libx264", threads=4, logger=None,
-                                              ffmpeg_params=["-preset", "ultrafast", "-crf", "18", "-tune", "fastdecode"])
-                    temp_files.append(temp_path)
-
-                    source_clip.close()
-                    try:
-                        spin_clip.close()
-                    except Exception:
-                        pass
-
-                    self.lbl_status.configure(
-                        text=f"Step 2/3: Processing clip {len(temp_files)}/{len(durations)} (spin)..."
-                    )
-
-                    clip_idx = (clip_idx + 1) % len(video_paths)
-                    i += 1
-
+                # Determine Motion Cadence for this cut:
+                if "Dezent" in fx_style:
+                    motion_type = 1 if (cut_idx % 2 == 0) else 3
+                elif "Volle Power" in fx_style or "Hardcore" in fx_style:
+                    motion_type = 0
+                elif "Zufällig" in fx_style:
+                    motion_type = random.choice([0, 1, 2, 3])
                 else:
-                    # ── NORMAL EFFECTS ───────────────────────────────────────────
-                    if duration >= 1.0 and random.random() < 0.4:
-                        seg_dur = duration / 4.0
-                        parts = []
-                        for part_idx in range(4):
-                            zoom_factor = 1.0 + (part_idx * 0.06)
-                            part_start = part_idx * seg_dur
-                            part_end = min((part_idx + 1) * seg_dur, duration)
-                            part_clip = sub_clip.subclip(part_start, part_end)
-                            if zoom_factor > 1.0:
-                                zoomed = part_clip.resize(zoom_factor)
-                                part_clip = zoomed.crop(
-                                    x_center=zoomed.w / 2, y_center=zoomed.h / 2,
-                                    width=tw, height=th,
-                                )
-                            parts.append(part_clip)
-                        sub_clip = concatenate_videoclips(parts, method="chain")
+                    # Dynamischer Rhythmus-Flow (Abwechslungsreich):
+                    # 0 = Downbeat Heavy (Tilt Shake + Punch + Flash)
+                    # 1 = Crisp Optical Punch-Zoom (NO wobble!) + Flash
+                    # 2 = Directional Pan Snap (Snap slide, NO tilt wobble) + RGB
+                    # 3 = Cinematic Slow Push-In (Smooth glide, NO shake)
+                    motion_type = cut_idx % 4
+
+                # Alternating direction signs
+                tilt_sign = 1.0 if ((cut_idx // 2) % 2 == 0) else -1.0
+                pan_sign = 1.0 if (cut_idx % 2 == 0) else -1.0
+
+                use_punch = allow_punch and (motion_type in [0, 1])
+                use_shake = allow_shake and (motion_type == 0) and (dur >= 0.22)
+                use_snap = (motion_type == 2) and (dur >= 0.18)
+                use_bloom = allow_bloom and (motion_type in [0, 1, 2])
+                use_rgb = allow_rgb and (motion_type in [0, 2])
+                use_push = allow_push and (motion_type == 3 or dur > 0.60)
+
+                def process_frame(gf, t):
+                    frame = gf(t)
+
+                    # 1. Spatial Transformation
+                    decay_zoom = ((max(0.0, 1.0 - (t / dur))) ** 3.0)
+                    cur_zoom = 1.0
+                    if use_punch:
+                        cur_zoom += (0.11 * intensity * decay_zoom)
+                    if use_push:
+                        cur_zoom += (0.038 * (t / dur))
+
+                    ang = 0.0
+                    dx, dy = 0.0, 0.0
+
+                    # Heavy Recoil Shake with alternating Tilt (Downbeats only!)
+                    if use_shake and t < sd:
+                        decay_shake = ((max(0.0, 1.0 - (t / sd))) ** 2.4)
+                        ang = np.sin(t * 36.0) * (2.2 * intensity * tilt_sign) * decay_shake
+                        dx = np.sin(t * 48.0) * (14.0 * intensity * pan_sign) * decay_shake
+                        dy = np.cos(t * 38.0) * (10.0 * intensity) * decay_shake
+
+                    # Directional Snap (Fast horizontal whip, zero tilt!)
+                    elif use_snap and t < 0.12:
+                        decay_snap = ((max(0.0, 1.0 - (t / 0.12))) ** 3.0)
+                        dx = (20.0 * intensity * pan_sign) * decay_snap
+
+                    if abs(ang) > 0.01 or cur_zoom > 1.002 or abs(dx) > 0.5 or abs(dy) > 0.5:
+                        M = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), ang, cur_zoom)
+                        M[0, 2] += dx
+                        M[1, 2] += dy
+                        frame = cv2.warpAffine(frame, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+                    # 2. Exposure Bloom Flash (Highlight-Burst)
+                    if use_bloom and t < fd:
+                        decay_fl = ((max(0.0, 1.0 - (t / fd))) ** 2.2) * intensity
+                        gain = 1.0 + (0.85 * decay_fl)
+                        warm_tint = np.array([255, 246, 225], dtype=np.float32)
+                        boosted = frame.astype(np.float32) * gain + (warm_tint * (0.25 * decay_fl))
+                        frame = np.clip(boosted, 0, 255).astype(np.uint8)
+
+                    # 3. Radial Lens Chromatic Aberration (RGB-Linsenzerlegung)
+                    if use_rgb and t < rd:
+                        decay_rgb = ((max(0.0, 1.0 - (t / rd))) ** 2.0) * intensity
+                        if decay_rgb > 0.02:
+                            r_scale = 1.0 + (0.014 * decay_rgb)
+                            b_scale = 1.0 - (0.014 * decay_rgb)
+                            Mr = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), 0, r_scale)
+                            Mb = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), 0, b_scale)
+                            r_ch = cv2.warpAffine(frame[:, :, 0], Mr, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                            b_ch = cv2.warpAffine(frame[:, :, 2], Mb, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                            frame[:, :, 0] = r_ch
+                            frame[:, :, 2] = b_ch
+
+                    # 4. Cinematic Vignette
+                    if allow_vignette and vignette_mask is not None:
+                        frame = cv2.multiply(frame, vignette_mask, scale=1.0 / 255.0)
+
+                    # 5. Cinematic S-Curve Contrast & Color Pop LUT
+                    if apply_cinematic_lut:
+                        frame = cv2.LUT(frame, CINEMATIC_LUT)
+
+                    return frame
+
+                return clip.fl(process_frame)
+
+            # Spinning Overlay Compositor
+            def apply_spinning_overlay(clip, cur_cut_idx, cut_global_start, dur):
+                if prepared_token is None:
+                    return clip
+
+                if "In der Mitte" in overlay_corner_mode:
+                    target_pos = center_pos
+                    prev_pos = center_pos
+                elif "Wechselt zum Takt" in overlay_corner_mode:
+                    target_corner_idx = cur_cut_idx % 4
+                    prev_corner_idx = (cur_cut_idx - 1) % 4
+                    target_pos = corners[target_corner_idx]
+                    prev_pos = corners[prev_corner_idx]
+                elif "Oben Links" in overlay_corner_mode:
+                    target_pos = corners[0]
+                    prev_pos = corners[0]
+                elif "Oben Rechts" in overlay_corner_mode:
+                    target_pos = corners[1]
+                    prev_pos = corners[1]
+                elif "Unten Rechts" in overlay_corner_mode:
+                    target_pos = corners[2]
+                    prev_pos = corners[2]
+                else:
+                    target_pos = corners[3]
+                    prev_pos = corners[3]
+
+                def overlay_frame(gf, t):
+                    frame = gf(t)
+                    global_t = cut_global_start + t
+
+                    # Frame-accurate: only show overlay once trigger is reached
+                    if global_t < active_overlay_start:
+                        return frame
+
+                    rel_t = global_t - active_overlay_start
+                    slide_dur = 0.12
+                    if "Wechselt zum Takt" in overlay_corner_mode and t < slide_dur and cur_cut_idx > 0:
+                        prog = min(1.0, t / slide_dur)
+                        ease = 1.0 - ((1.0 - prog) ** 3)
+                        cx = int(prev_pos[0] + (target_pos[0] - prev_pos[0]) * ease)
+                        cy = int(prev_pos[1] + (target_pos[1] - prev_pos[1]) * ease)
                     else:
-                        effect = random.randint(0, 7)
-                        if effect == 1:
-                            flash = ColorClip(size=target_size, color=[255, 255, 255]).set_duration(min(0.1, duration)).set_opacity(0.4)
-                            sub_clip = CompositeVideoClip([sub_clip, flash])
-                        elif effect == 2:
-                            zoomed = sub_clip.resize(1.1)
-                            sub_clip = zoomed.crop(x_center=zoomed.w / 2, y_center=zoomed.h / 2, width=tw, height=th)
-                        elif effect == 3:
-                            sub_clip = sub_clip.fx(vfx.mirror_x)
-                        elif effect == 4:
-                            sub_clip = sub_clip.fx(vfx.speedx, 1.2)
-                        elif effect == 5:
-                            sub_clip = sub_clip.fl_image(apply_glitch)
-                        elif effect == 6:
-                            sub_clip = sub_clip.fx(vfx.fadein, min(0.3, duration))
-                        elif effect == 7:
-                            # 2x quick zoom in and zoom out (beat bounce / pulse effect)
-                            def double_zoom(get_frame, t):
-                                phase = (t / duration) * 2.0 * np.pi * 2.0  # 2 full waves
-                                s = 1.0 + 0.18 * max(0.0, np.sin(phase))
-                                frame = get_frame(t)
-                                img = PIL.Image.fromarray(frame)
-                                nw, nh = int(round(tw * s)), int(round(th * s))
-                                img_resized = img.resize((nw, nh), resample=PIL.Image.BILINEAR)
-                                left = (nw - tw) // 2
-                                top = (nh - th) // 2
-                                cropped = img_resized.crop((left, top, left + tw, top + th))
-                                return np.array(cropped)
+                        cx, cy = target_pos
 
-                            sub_clip = sub_clip.fl(double_zoom)
+                    angle = (rel_t * 360.0 * overlay_speed_val) % 360.0
+                    rotated = prepared_token.rotate(-angle, resample=PIL.Image.BILINEAR)
 
+                    bg_pil = PIL.Image.fromarray(frame.astype(np.uint8))
+                    bg_pil.paste(rotated, (cx, cy), rotated)
+                    return np.array(bg_pil)
+
+                return clip.fl(overlay_frame)
+
+            if "Dezent 15%" in clip_audio_setting:
+                clip_audio_vol = 0.15
+            elif "Mittel 35%" in clip_audio_setting:
+                clip_audio_vol = 0.35
+            else:
+                clip_audio_vol = 0.0
+
+            cpu_threads = max(4, min(16, os.cpu_count() or 4))
+            video_paths = self.video_paths
+            clip_idx = 0
+            i = 0
+            total_dur_count = len(durations)
+
+            while i < total_dur_count:
+                if self.is_cancelled:
+                    raise InterruptedError("Vorgang durch Benutzer abgebrochen.")
+
+                duration = float(durations[i])
+                if duration < 0.10:
+                    duration = 0.10
+
+                cut_global_start = clean_frame_indices[i] / float(fps)
+                cur_path = video_paths[clip_idx]
+                source_clip = open_source(cur_path)
+
+                # Determine effect mode for this clip
+                use_speedramp = allow_speedramp and not isinstance(source_clip, ImageClip) and (duration < 0.8) and (i % 3 == 0)
+                if use_speedramp:
+                    speed_mult = 1.30
+                    raw_cut = cut_source(source_clip, duration * speed_mult, cur_path)
+                    sub_clip = fit_clip(raw_cut, tw, th).fx(vfx.speedx, speed_mult)
+                    if sub_clip.duration < duration:
+                        sub_clip = sub_clip.fx(vfx.loop, duration=duration)
+                    else:
+                        sub_clip = sub_clip.subclip(0, duration)
+                else:
+                    raw_cut = cut_source(source_clip, duration, cur_path)
+                    sub_clip = fit_clip(raw_cut, tw, th)
+
+                # Apply Pro Effects with diverse rhythmic cadence
+                sub_clip = apply_pro_effects(sub_clip, duration, cut_idx=i)
+
+                # Apply Spinning Overlay if clip overlaps or is past active_overlay_start
+                if has_overlay and (cut_global_start + duration >= active_overlay_start):
+                    sub_clip = apply_spinning_overlay(sub_clip, i, cut_global_start, duration)
+
+                # Audio handling
+                seg_has_audio = False
+                if clip_audio_vol > 0.0:
+                    try:
+                        if raw_cut.audio is not None:
+                            sub_clip = sub_clip.set_audio(raw_cut.audio.volumex(clip_audio_vol))
+                            seg_has_audio = True
+                    except Exception:
+                        seg_has_audio = False
+
+                if not seg_has_audio:
                     sub_clip = sub_clip.without_audio()
 
-                    temp_path = f"_temp_seg_{len(temp_files):04d}.mp4"
-                    sub_clip.write_videofile(temp_path, fps=30, codec="libx264", threads=4, logger=None,
-                                             ffmpeg_params=["-preset", "ultrafast", "-crf", "18", "-tune", "fastdecode"])
-                    temp_files.append(temp_path)
+                temp_path = os.path.join(temp_dir, f"seg_{len(temp_files):04d}.mp4")
+                write_args = {
+                    "fps": fps,
+                    "codec": "libx264",
+                    "threads": cpu_threads,
+                    "logger": None,
+                    "ffmpeg_params": [
+                        "-preset", preset_val,
+                        "-crf", crf_val,
+                        "-tune", "film",
+                        "-pix_fmt", "yuv420p"
+                    ]
+                }
+                if seg_has_audio:
+                    write_args["audio_codec"] = "aac"
 
-                    source_clip.close()
-                    try:
-                        sub_clip.close()
-                    except Exception:
-                        pass
+                sub_clip.write_videofile(temp_path, **write_args)
+                temp_files.append(temp_path)
 
-                    self.lbl_status.configure(
-                        text=f"Step 2/3: Processing clip {len(temp_files)}/{len(durations)}..."
-                    )
-
-                    clip_idx = (clip_idx + 1) % len(video_paths)
-                    i += 1
-
-            self.lbl_status.configure(text="Step 3/3: Rendering final video... (See terminal)")
-
-            # Load temp segments (just references, no full decode into RAM)
-            final_clips = [VideoFileClip(p) for p in temp_files]
-            final_video = concatenate_videoclips(final_clips, method="chain")
-
-            audio_clip = AudioFileClip(self.audio_path).subclip(start_t, end_t)
-            final_video = final_video.set_audio(audio_clip)
-
-            final_video.write_videofile(
-                out_path, fps=30,
-                codec="libx264",
-                audio_codec="aac",
-                threads=6,
-                ffmpeg_params=["-preset", "fast", "-crf", "18"],
-            )
-
-            # Cleanup
-            audio_clip.close()
-            final_video.close()
-            for c in final_clips:
-                c.close()
-            for p in temp_files:
+                source_clip.close()
                 try:
-                    os.remove(p)
+                    sub_clip.close()
                 except Exception:
                     pass
 
-            self.lbl_status.configure(text="Finished successfully!")
-            messagebox.showinfo("Success", f"Edit generated successfully and saved to:\n{out_path}")
+                clip_idx = (clip_idx + 1) % len(video_paths)
+                i += 1
 
+                pct = 0.20 + (0.68 * (i / total_dur_count))
+                self.set_status(f"Schritt 2/3: Erstelle Beat-Clip {len(temp_files)}/{total_dur_count} ({fps} FPS, {tw}x{th})...", pct)
+
+            if self.is_cancelled:
+                raise InterruptedError("Vorgang durch Benutzer abgebrochen.")
+
+            # -------------------------------------------------------------
+            # STEP 3: Ultra-Fast Concat + Studio Master Audio Mux (320 kbps)
+            # -------------------------------------------------------------
+            self.set_status("Schritt 3/3: Finale Studio-Zusammensetzung & Audio-Muxing...", 0.90)
+
+            concat_txt = os.path.join(temp_dir, "concat_list.txt")
+            with open(concat_txt, "w", encoding="utf-8") as f:
+                for tp in temp_files:
+                    f.write(f"file '{os.path.abspath(tp).replace(os.sep, '/')}'\n")
+
+            visual_concat_mp4 = os.path.join(temp_dir, "visual_concat.mp4")
+            cmd_concat = [
+                self.ffmpeg_exe, "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_txt,
+                "-c", "copy",
+                visual_concat_mp4
+            ]
+            res_c = subprocess.run(cmd_concat, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res_c.returncode != 0:
+                cmd_concat_fallback = [
+                    self.ffmpeg_exe, "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", concat_txt,
+                    "-c:v", "libx264",
+                    "-preset", preset_val,
+                    "-crf", crf_val,
+                    visual_concat_mp4
+                ]
+                subprocess.run(cmd_concat_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+            self.set_status("Schritt 3/3: Muxe unkomprimiertes Master-Audio & Fade-Out...", 0.95)
+
+            audio_filter = f"afade=t=out:st={max(0, total_duration - 0.8):.2f}:d=0.8" if enable_fade_out else "anull"
+            final_cmd = [
+                self.ffmpeg_exe, "-y",
+                "-i", visual_concat_mp4,
+                "-i", master_audio_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "320k",
+                "-af", audio_filter,
+                "-shortest",
+                out_path
+            ]
+            subprocess.run(final_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+            self.last_rendered_path = out_path
+            self.set_status(f"Export erfolgreich abgeschlossen: {os.path.basename(out_path)}", 1.0)
+            self.show_info("Fertig", f"Video erfolgreich gespeichert unter:\n{out_path}")
+            self.after(0, lambda: self.post_action_frame.pack(fill="x", padx=20, pady=(6, 10)))
+
+        except InterruptedError:
+            self.set_status("Rendern abgebrochen. Keine Datei erstellt.", 0.0)
         except Exception as e:
-            err = traceback.format_exc()
-            print(err)
-            self.lbl_status.configure(text="Error occurred! Check terminal for details.")
-            messagebox.showerror("Error", f"An error occurred:\n{e}")
+            traceback.print_exc()
+            self.set_status(f"Fehler: {e}", 0.0)
+            self.show_error("Fehler", f"Fehler beim Rendern:\n{traceback.format_exc()}")
         finally:
-            self.btn_generate.configure(state="normal")
-            # Emergency cleanup of temp files if error occurred
-            for p in locals().get("temp_files", []):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            self.after(0, lambda: self.btn_generate.configure(state="normal"))
+            self.after(0, lambda: self.btn_cancel.configure(state="disabled"))
+
 
 if __name__ == "__main__":
     app = EditMakerApp()
